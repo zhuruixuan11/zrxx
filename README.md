@@ -5,9 +5,32 @@
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![Node](https://img.shields.io/badge/node-20-blue)
 
-一个可本地部署的 A 股投研工具：真实行情 + 技术指标 + AI 分析 + 策略回测 + 模拟持仓 + 到价预警。
+## 项目介绍
 
-数据源全部免费（baostock / 东方财富 / 新浪 / akshare），无需申请 Key；AI 分析可选接入 DeepSeek，不配 Key 时自动进入 Mock 模式，功能仍可完整体验流程。
+**衡策**是一个可完全本地部署的 A 股智能投研平台：真实行情 + 技术指标 + AI 分析 + 策略回测 + 模拟持仓 + 到价预警，覆盖从「看盘」到「验证想法」的完整链路。
+
+做这个项目的初衷：市面上的投研工具要么依赖付费数据源，要么要把数据传到第三方服务，「数据从哪来、AI 凭什么给结论」都不透明。衡策把所有环节放在本地——行情来自免费公开接口，AI 回答被强制约束在真实数据范围内，不给目标价、不空谈，分析结论还能一键进回测用历史数据验证。
+
+### 核心亮点
+
+- **数据真实可查**：全市场 5000+ 只股票的实时快照与日 K 线（沪深 + 北交所），全部来自免费接口（baostock / 东方财富 / 新浪 / akshare），无需注册任何 Key；AI 不配 LLM Key 时自动进入 Mock 模式，完整流程仍可体验
+- **AI 有据可依**：LangGraph Agent 自动注入行情、估值（PE/PB）、技术指标（MA/RSI/60 日位置/波动率/量比），提示词硬约束「只能引用给定数据、缺失写明数据不足」；分析类回答可一键跳转回测页验证
+- **策略回测闭环**：多策略、参数可调、历史记录与多策略对比，用数据说话而不是口头判断
+- **一键部署**：Docker Compose 两条命令启动（nginx + uvicorn），数据持久化在本地卷
+- **工程质量**：JWT 密钥强制配置、越权防护、接口限流、异常脱敏、依赖版本精确锁定、GitHub Actions CI
+
+### 架构
+
+```mermaid
+flowchart LR
+    UI["Vue 3 + Element Plus + ECharts"] -->|"HTTP /api"| API["FastAPI"]
+    API --> AGENT["LangGraph Agent"]
+    API --> ENG["回测引擎"]
+    API --> DB[("SQLite (WAL)")]
+    AGENT -->|"行情 / K 线 / 估值"| DS["baostock / 东财 / 新浪"]
+    AGENT --> LLM["DeepSeek / Qwen / OpenAI / Mock"]
+    API --> ALARM["预警轮询 + 邮件推送"]
+```
 
 ## 功能
 
