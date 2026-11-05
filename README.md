@@ -1,5 +1,11 @@
 # 衡策 · A 股智能投研平台
 
+<!-- 开源前把下面两处「你的用户名」替换成你的 GitHub 用户名；推上 GitHub 后徽章会自动出现 -->
+[![CI](https://github.com/你的用户名/wealthai/actions/workflows/ci.yml/badge.svg)](https://github.com/你的用户名/wealthai/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+![Python](https://img.shields.io/badge/python-3.12-blue)
+![Node](https://img.shields.io/badge/node-20-blue)
+
 一个可本地部署的 A 股投研工具：真实行情 + 技术指标 + AI 分析 + 策略回测 + 模拟持仓 + 到价预警。
 
 数据源全部免费（baostock / 东方财富 / 新浪 / akshare），无需申请 Key；AI 分析可选接入 DeepSeek，不配 Key 时自动进入 Mock 模式，功能仍可完整体验流程。
