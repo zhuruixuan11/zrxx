@@ -106,10 +106,19 @@ async def get_quote(symbol: str, market: str = "auto") -> Dict[str, Any]:
 
     # 1) A 股走 baostock（日线最新收盘 + 东方财富实时盘口补充）
     if is_a_share(symbol):
-        result = await _bs_quote(symbol)
+        try:
+            result = await _bs_quote(symbol)
+        except Exception as e:
+            # baostock 挂起/超时等异常不能向上抛成 500，落到新浪快照兜底
+            logger.warning(f"baostock quote failed ({symbol})，走新浪兜底：{e}")
+            result = None
         if result and "error" not in result:
             _cache_set(_QUOTE_CACHE, key, result)
             return result
+        sina_rt = await _sina_realtime(symbol)
+        if sina_rt and "error" not in sina_rt:
+            _cache_set(_QUOTE_CACHE, key, sina_rt)
+            return sina_rt
         return result or {"error": "数据源不可用", "symbol": symbol}
 
     # 2) 非 A 股（如 AAPL）→ 尝试 yfinance
@@ -245,7 +254,14 @@ async def _bs_quote(symbol: str) -> Optional[Dict[str, Any]]:
     loop = asyncio.get_event_loop()
     # 东方财富实时盘口与 baostock 日线并行，缩短单只行情耗时
     em_task = asyncio.create_task(_em_push2_realtime(bs_code))
-    rs = await loop.run_in_executor(None, lambda: _bs_run_in_executor(_do_query))
+    # baostock 服务端偶发挂起（限流/网络），必须加超时，否则锁死执行器并阻塞兜底链路
+    try:
+        rs = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: _bs_run_in_executor(_do_query)), timeout=25)
+    except asyncio.TimeoutError:
+        _bs_close()  # 挂死的会话不能留着，下次重新 login
+        logger.warning(f"baostock quote timeout ({symbol})")
+        raise
     bs_failed = rs is None or rs.error_code != "0"
     rows: List[List[str]] = []
     if bs_failed:
@@ -348,7 +364,14 @@ async def _bs_history(symbol: str, days: int = 30) -> Optional[Dict[str, Any]]:
         )
 
     loop = asyncio.get_event_loop()
-    rs = await loop.run_in_executor(None, lambda: _bs_run_in_executor(_do_query))
+    # 同上：baostock 挂起时超时返回 None，让上层走新浪 K 线兜底
+    try:
+        rs = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: _bs_run_in_executor(_do_query)), timeout=25)
+    except asyncio.TimeoutError:
+        _bs_close()  # 挂死的会话不能留着，下次重新 login
+        logger.warning(f"baostock history timeout ({symbol} {days}d)，尝试兜底数据源")
+        return None
     if rs is None or rs.error_code != "0":
         return None
 

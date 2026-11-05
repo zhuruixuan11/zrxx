@@ -17,6 +17,8 @@ from .state import IntentType, INTENT_LIST
 _KEYWORD_RULES: list[tuple[str, list[str]]] = [
     (IntentType.PORTFOLIO_QUERY,  ["投资组合", "我的组合", "组合", "持仓", "总资产", "我的资产", "盈亏", "收益", "赚多少", "亏多少", "portfolio", "holding"]),
     (IntentType.MARKET_QUERY,     ["行情", "股价", "涨跌", "走势", "K线", "最新价", "现在多少", "收盘价", "开盘价", "market", "quote"]),
+    # 市场环境 / 宏观与资金面：这类问题不需要股票代码，走分析流程注入宏观数据
+    (IntentType.INVESTMENT_ANALYSIS, ["宏观", "GDP", "CPI", "M2", "SHIBOR", "通胀", "货币政策", "降准", "降息", "加息", "流动性", "资金面", "龙虎榜", "主力资金", "大盘", "市场环境", "市场怎么", "大盘怎么"]),
     (IntentType.KNOWLEDGE_QUERY,  ["什么是", "什么叫", "怎么选", "知识", "策略", "术语", "入门", "解释", "是什么意思"]),
     (IntentType.ALERT_CONFIG,     ["提醒", "预警", "止盈", "止损", "监控", "设一个", "设置", "alert", "notify"]),
     (IntentType.RISK_ASSESSMENT,  ["风险", "回撤", "波动", "警示", "安全", "risk", "volatil"]),
