@@ -43,3 +43,6 @@ yfinance>=0.2.40
 # ============ 可选（RAG 向量库）========
 # 先用本地 JSON + 关键词检索，避免 chromadb 安装重量
 # 需要时再：pip install chromadb sentence-transformers
+
+# ============ 测试 ============
+pytest>=9.0
