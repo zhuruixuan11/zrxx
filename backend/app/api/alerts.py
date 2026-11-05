@@ -158,8 +158,8 @@ async def delete_alert(alert_id: str, user: User = Depends(get_current_user)):
 
 @router.post("/check")
 async def check_now(user: User = Depends(get_current_user)):
-    """立即检查一轮（非交易时段也能验证条件配置是否生效）。"""
-    result = await check_all_alerts()
+    """立即检查一轮（非交易时段也能验证条件配置是否生效）。只检查当前用户的预警。"""
+    result = await check_all_alerts(user_id=user.id)
     return {
         "code": 0, "msg": "ok",
         "data": {

@@ -5,7 +5,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 
 from ..database import async_session
 from ..models.dataset import Dataset, DatasetSample
@@ -13,6 +13,23 @@ from ..models.user import User
 from ..security import get_current_user
 
 router = APIRouter(prefix="/api/datasets", tags=["datasets"])
+
+
+async def _owned_dataset(session, dataset_id: str, user: User) -> Dataset:
+    """取属于当前用户的数据集；不存在或非本人时统一返回 404（不区分两种情况，避免探测）。"""
+    ds = (await session.execute(
+        select(Dataset).where(Dataset.id == dataset_id, Dataset.created_by == user.id)
+    )).scalar_one_or_none()
+    if not ds:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    return ds
+
+
+def _visible_dataset(ds: Optional[Dataset], user: User) -> Dataset:
+    """读取类接口的可见性规则：本人数据集，或他人已发布的。否则按不存在处理。"""
+    if not ds or (ds.created_by != user.id and not ds.is_published):
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    return ds
 
 
 # ============ Schema ============
@@ -89,7 +106,11 @@ async def _refresh_count(session, dataset_id: str):
 @router.get("")
 async def list_datasets(type: Optional[str] = None, user: User = Depends(get_current_user)):
     async with async_session() as session:
-        stmt = select(Dataset).order_by(Dataset.is_published.desc(), Dataset.updated_at.desc())
+        stmt = (
+            select(Dataset)
+            .where(or_(Dataset.created_by == user.id, Dataset.is_published.is_(True)))
+            .order_by(Dataset.is_published.desc(), Dataset.updated_at.desc())
+        )
         if type:
             stmt = stmt.where(Dataset.type == type)
         rows = (await session.execute(stmt)).scalars().all()
@@ -112,17 +133,14 @@ async def create_dataset(req: DatasetCreate, user: User = Depends(get_current_us
 async def get_dataset(dataset_id: str, user: User = Depends(get_current_user)):
     async with async_session() as session:
         ds = (await session.execute(select(Dataset).where(Dataset.id == dataset_id))).scalar_one_or_none()
-        if not ds:
-            raise HTTPException(status_code=404, detail="数据集不存在")
+        _visible_dataset(ds, user)
         return {"code": 0, "msg": "ok", "data": _dataset_to_dict(ds)}
 
 
 @router.put("/{dataset_id}")
 async def update_dataset(dataset_id: str, req: DatasetUpdate, user: User = Depends(get_current_user)):
     async with async_session() as session:
-        ds = (await session.execute(select(Dataset).where(Dataset.id == dataset_id))).scalar_one_or_none()
-        if not ds:
-            raise HTTPException(status_code=404, detail="数据集不存在")
+        ds = await _owned_dataset(session, dataset_id, user)
         if req.name is not None:
             ds.name = req.name
         if req.description is not None:
@@ -135,9 +153,7 @@ async def update_dataset(dataset_id: str, req: DatasetUpdate, user: User = Depen
 @router.delete("/{dataset_id}")
 async def delete_dataset(dataset_id: str, user: User = Depends(get_current_user)):
     async with async_session() as session:
-        ds = (await session.execute(select(Dataset).where(Dataset.id == dataset_id))).scalar_one_or_none()
-        if not ds:
-            raise HTTPException(status_code=404, detail="数据集不存在")
+        ds = await _owned_dataset(session, dataset_id, user)
         await session.delete(ds)
         await session.commit()
     return {"code": 0, "msg": "ok"}
@@ -148,9 +164,7 @@ async def delete_dataset(dataset_id: str, user: User = Depends(get_current_user)
 async def publish_dataset(dataset_id: str, publish: bool = True, user: User = Depends(get_current_user)):
     """发布或取消发布数据集。发布后，Agent 对话时会自动从这些数据集里检索知识。"""
     async with async_session() as session:
-        ds = (await session.execute(select(Dataset).where(Dataset.id == dataset_id))).scalar_one_or_none()
-        if not ds:
-            raise HTTPException(status_code=404, detail="数据集不存在")
+        ds = await _owned_dataset(session, dataset_id, user)
         ds.is_published = bool(publish)
         ds.updated_at = datetime.utcnow()
         await session.commit()
@@ -164,8 +178,7 @@ async def publish_dataset(dataset_id: str, publish: bool = True, user: User = De
 async def list_samples(dataset_id: str, page: int = 1, size: int = 20, user: User = Depends(get_current_user)):
     async with async_session() as session:
         ds = (await session.execute(select(Dataset).where(Dataset.id == dataset_id))).scalar_one_or_none()
-        if not ds:
-            raise HTTPException(status_code=404, detail="数据集不存在")
+        _visible_dataset(ds, user)
         total = (await session.execute(
             select(func.count()).select_from(DatasetSample).where(DatasetSample.dataset_id == dataset_id)
         )).scalar_one()
@@ -183,9 +196,7 @@ async def list_samples(dataset_id: str, page: int = 1, size: int = 20, user: Use
 @router.post("/{dataset_id}/samples")
 async def add_sample(dataset_id: str, req: SampleCreate, user: User = Depends(get_current_user)):
     async with async_session() as session:
-        ds = (await session.execute(select(Dataset).where(Dataset.id == dataset_id))).scalar_one_or_none()
-        if not ds:
-            raise HTTPException(status_code=404, detail="数据集不存在")
+        ds = await _owned_dataset(session, dataset_id, user)
         sample = DatasetSample(
             dataset_id=dataset_id,
             instruction=req.instruction, input_text=req.input_text, output=req.output,
@@ -204,9 +215,7 @@ async def add_sample(dataset_id: str, req: SampleCreate, user: User = Depends(ge
 @router.post("/{dataset_id}/samples/batch")
 async def batch_add_samples(dataset_id: str, req: SampleBatch, user: User = Depends(get_current_user)):
     async with async_session() as session:
-        ds = (await session.execute(select(Dataset).where(Dataset.id == dataset_id))).scalar_one_or_none()
-        if not ds:
-            raise HTTPException(status_code=404, detail="数据集不存在")
+        ds = await _owned_dataset(session, dataset_id, user)
         created = 0
         for s in req.samples:
             session.add(DatasetSample(
@@ -226,6 +235,7 @@ async def batch_add_samples(dataset_id: str, req: SampleBatch, user: User = Depe
 @router.delete("/{dataset_id}/samples/{sample_id}")
 async def delete_sample(dataset_id: str, sample_id: str, user: User = Depends(get_current_user)):
     async with async_session() as session:
+        await _owned_dataset(session, dataset_id, user)
         s = (await session.execute(
             select(DatasetSample).where(DatasetSample.id == sample_id, DatasetSample.dataset_id == dataset_id)
         )).scalar_one_or_none()
@@ -271,9 +281,7 @@ async def upload_jsonl(dataset_id: str, file: UploadFile = File(...), user: User
 
     created = 0
     async with async_session() as session:
-        ds = (await session.execute(select(Dataset).where(Dataset.id == dataset_id))).scalar_one_or_none()
-        if not ds:
-            raise HTTPException(status_code=404, detail="数据集不存在")
+        await _owned_dataset(session, dataset_id, user)
         for item in items:
             sample = DatasetSample(dataset_id=dataset_id)
             if "messages" in item:

@@ -221,9 +221,17 @@ async function scrollBottom() {
   }
 }
 
-function formatMsg(text: string): string {
-  // 简单的 markdown-ish 渲染：换行、加粗、列表
+function escapeHtml(text: string): string {
   return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+function formatMsg(text: string): string {
+  // 先转义 HTML 再做 markdown-ish 渲染：AI 回复可能携带外部新闻内容或被诱导输出标记，防止 XSS
+  return escapeHtml(text)
     .replace(/\n/g, '<br>')
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
 }

@@ -44,7 +44,15 @@ async def lifespan(app: fastapi.FastAPI):
     """应用启动时自动建表，并拉起到价预警轮询。"""
     logger.info(f"衡策 启动中 (version={settings.APP_VERSION}, LLM={settings.LLM_PROVIDER})")
     if settings.JWT_SECRET_KEY.startswith("change-me"):
-        logger.warning("JWT_SECRET_KEY 仍为默认值，请尽快替换为随机串（生产环境必须修改）")
+        # 生成随机密钥：python -c "import secrets;print(secrets.token_urlsafe(48))"
+        if settings.DEBUG:
+            logger.warning("JWT_SECRET_KEY 仍为默认值（DEBUG 模式仅告警）；生产部署必须设置为随机串")
+        else:
+            # 默认密钥是公开源码里的常量，非 DEBUG 环境继续运行等于允许伪造任意用户 token
+            raise RuntimeError(
+                "JWT_SECRET_KEY 为默认值，拒绝启动。"
+                "请生成随机密钥后写入 backend/.env：python -c \"import secrets;print(secrets.token_urlsafe(48))\""
+            )
     await init_tables()
     start_monitor()
     warmup_task = asyncio.create_task(prewarm_caches())

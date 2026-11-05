@@ -112,17 +112,21 @@ def _send_email(subject: str, body: str, receiver: str) -> bool:
         return False
 
 
-async def check_all_alerts() -> Dict[str, Any]:
-    """跑一轮检查。返回本轮统计，供 API 手动触发时复用。"""
+async def check_all_alerts(user_id: str | None = None) -> Dict[str, Any]:
+    """跑一轮检查。返回本轮统计，供 API 手动触发时复用。
+
+    传 user_id 时只检查该用户的预警（手动检查接口用）；
+    不传时检查全部用户（后台轮询用）。
+    """
     triggered: List[Dict[str, Any]] = []
     checked = 0
 
     async with async_session() as db:
-        rows = (
-            await db.execute(
-                select(PriceAlert).where(PriceAlert.enabled.is_(True))
-            )
-        ).scalars().all()
+        stmt = select(PriceAlert).where(PriceAlert.enabled.is_(True))
+        if user_id:
+            # 手动检查只作用于当前用户，避免触碰/泄露他人预警
+            stmt = stmt.where(PriceAlert.user_id == user_id)
+        rows = (await db.execute(stmt)).scalars().all()
 
         for alert in rows:
             quote = await get_quote(alert.symbol)
