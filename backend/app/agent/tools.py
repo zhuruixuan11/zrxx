@@ -22,6 +22,7 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 import httpx
+import pandas as pd
 from loguru import logger
 
 
@@ -664,3 +665,119 @@ async def get_portfolio_summary(user_id: str, session) -> Dict[str, Any]:
         "holdings_count": len(holdings_out),
         "holdings": holdings_out,
     }
+
+
+# ========== 宏观经济与市场资金面（akshare 免费源，无需 Token） ==========
+# 宏观数据变化极慢（月/季度频率），缓存 6 小时；资金面按交易日更新，缓存 30 分钟
+_MACRO_CACHE: "OrderedDict[str, tuple[float, Dict[str, Any]]]" = OrderedDict()
+_FUND_CACHE: "OrderedDict[str, tuple[float, Dict[str, Any]]]" = OrderedDict()
+_MACRO_TTL = 6 * 3600.0
+_FUND_TTL = 30 * 60.0
+
+
+def _df_col(df, *keywords):
+    """按关键词模糊匹配 DataFrame 列名（akshare 各版本中文列名不完全一致）。"""
+    for c in df.columns:
+        if all(k in str(c) for k in keywords):
+            return c
+    return None
+
+
+def _df_cell(df, col, row=0):
+    if col is None or df.empty or len(df) <= row:
+        return None
+    v = df.iloc[row][col]
+    return None if pd.isna(v) else v
+
+
+async def get_macro_overview() -> Dict[str, Any]:
+    """最新宏观读数：GDP / CPI / M2 同比 + SHIBOR 1 周利率。"""
+    cached = _cache_get(_MACRO_CACHE, "macro", _MACRO_TTL)
+    if cached is not None:
+        return cached
+
+    import akshare as ak
+
+    out: Dict[str, Any] = {"updated_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M")}
+
+    async def _one(name: str, fn, cols: List[str], out_key: str, row: int = 0):
+        try:
+            df = await asyncio.wait_for(asyncio.to_thread(fn), 20)
+            fetched: Dict[str, Any] = {}
+            for out_field, keywords in cols:
+                fetched[out_field] = _df_cell(df, _df_col(df, *keywords), row=row)
+            if any(v is not None for v in fetched.values()):
+                out[out_key] = fetched
+        except Exception as e:
+            logger.warning(f"[macro] {name} 获取失败：{e}")
+
+    await asyncio.gather(
+        _one("GDP", ak.macro_china_gdp,
+             [("period", ["季度"]), ("yoy", ["国内生产总值", "同比"])], "gdp"),
+        _one("CPI", ak.macro_china_cpi,
+             [("period", ["月份"]), ("yoy", ["全国", "同比"])], "cpi"),
+        _one("M2", ak.macro_china_money_supply,
+             [("period", ["月份"]), ("yoy", ["M2", "同比"])], "m2"),
+        _one("SHIBOR", ak.macro_china_shibor_all,
+             [("date", ["日期"]), ("rate_1w", ["1W", "定价"])], "shibor", row=-1),
+    )
+
+    if len(out) > 1:
+        _cache_set(_MACRO_CACHE, "macro", out)
+    return out
+
+
+async def get_fund_flow_overview() -> Dict[str, Any]:
+    """市场资金面：北向资金最近净买额、大盘主力资金、最新龙虎榜净买居前。"""
+    cached = _cache_get(_FUND_CACHE, "funds", _FUND_TTL)
+    if cached is not None:
+        return cached
+
+    import akshare as ak
+
+    out: Dict[str, Any] = {"updated_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M")}
+
+    # 北向资金：2024-08 起交易所停止披露当日净买额，无可靠免费源，不再提供，避免给 LLM 死数据
+
+    # 大盘主力资金净流入（最近一个交易日）
+    try:
+        df = await asyncio.wait_for(asyncio.to_thread(ak.stock_market_fund_flow), 20)
+        v = _df_cell(df, _df_col(df, "主力", "净流入", "净额"), row=-1)
+        p = _df_cell(df, _df_col(df, "主力", "净流入", "净占比"), row=-1)
+        d = _df_cell(df, _df_col(df, "日期"), row=-1)
+        if v is not None:
+            out["market_main_flow"] = {
+                "date": str(d),
+                "net_inflow_yi": round(float(v) / 1e8, 2),
+                "net_pct": round(float(p), 2) if p is not None else None,
+            }
+    except Exception as e:
+        logger.warning(f"[funds] 大盘主力资金获取失败：{e}")
+
+    # 最新龙虎榜净买额居前（取近 3 天数据，按净买额排序取前 5）
+    try:
+        today = _dt.date.today()
+        start = (today - _dt.timedelta(days=4)).strftime("%Y%m%d")
+        end = today.strftime("%Y%m%d")
+        df = await asyncio.wait_for(
+            asyncio.to_thread(ak.stock_lhb_detail_em, start_date=start, end_date=end), 20)
+        code_c, name_c = _df_col(df, "代码"), _df_col(df, "名称")
+        net_c, chg_c, date_c = _df_col(df, "龙虎榜净买额"), _df_col(df, "涨跌幅"), _df_col(df, "上榜日")
+        if net_c and code_c and not df.empty:
+            # 只看最新一个上榜日，避免多天混排且同一股票重复出现
+            latest = df[date_c].max() if date_c else None
+            if date_c and latest is not None:
+                df = df[df[date_c] == latest]
+            df = df.dropna(subset=[net_c]).sort_values(net_c, ascending=False).head(5)
+            out["lhb_top"] = [{
+                "code": str(r[code_c]), "name": str(r[name_c]),
+                "net_buy_yi": round(float(r[net_c]) / 1e8, 2),
+                "change_pct": round(float(r[chg_c]), 2) if chg_c and not pd.isna(r[chg_c]) else None,
+                "date": str(r[date_c]) if date_c else None,
+            } for _, r in df.iterrows()]
+    except Exception as e:
+        logger.warning(f"[funds] 龙虎榜获取失败：{e}")
+
+    if len(out) > 1:
+        _cache_set(_FUND_CACHE, "funds", out)
+    return out

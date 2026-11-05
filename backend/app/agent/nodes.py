@@ -21,7 +21,14 @@ from .rag import retrieve
 from .indicators import compute_indicators
 from .router import classify_intent_llm, _keyword_classify, pick_clarification_question
 from .state import AgentState, INTENT_LIST
-from .tools import get_historical, get_portfolio_summary, get_quote, normalize_a_share
+from .tools import (
+    get_fund_flow_overview,
+    get_historical,
+    get_macro_overview,
+    get_portfolio_summary,
+    get_quote,
+    normalize_a_share,
+)
 from .news import fetch_news, format_news_for_prompt
 from .profile import get_profile_summary, get_risk_level
 
@@ -174,6 +181,8 @@ async def node_analysis(state: AgentState) -> Dict[str, Any]:
             tg.create_task(_safe(_fetch_indicators(symbols[0]), 8, {}))
             if symbols else None
         )
+        t_macro = tg.create_task(_safe(get_macro_overview(), 12, {}))
+        t_funds = tg.create_task(_safe(get_fund_flow_overview(), 12, {}))
 
     portfolio = t_portfolio.result()
     profile_summary = t_profile.result()
@@ -181,6 +190,8 @@ async def node_analysis(state: AgentState) -> Dict[str, Any]:
     rag = t_rag.result()
     news_items = t_news.result()
     indicators = t_ind.result() if t_ind else {}
+    macro = t_macro.result()
+    funds = t_funds.result()
 
     # 构建 LLM 上下文
     context_parts = [f"用户问题：{message}"]
@@ -231,6 +242,37 @@ async def node_analysis(state: AgentState) -> Dict[str, Any]:
             context_parts.append(
                 f"技术指标（{indicators.get('bars', 0)} 根日线，前复权）：" + "，".join(parts)
             )
+
+    # 宏观经济读数（6 小时缓存，数据缺失时跳过、不留空字段）
+    if macro:
+        m = []
+        if macro.get("gdp", {}).get("yoy") is not None:
+            m.append(f"GDP 同比 {macro['gdp']['yoy']}%（{macro['gdp'].get('period', '')}）")
+        if macro.get("cpi", {}).get("yoy") is not None:
+            m.append(f"CPI 同比 {macro['cpi']['yoy']}%（{macro['cpi'].get('period', '')}）")
+        if macro.get("m2", {}).get("yoy") is not None:
+            m.append(f"M2 同比 {macro['m2']['yoy']}%")
+        if macro.get("shibor", {}).get("rate_1w") is not None:
+            m.append(f"SHIBOR 1周 {macro['shibor']['rate_1w']}%")
+        if m:
+            context_parts.append("宏观环境：" + "，".join(m))
+
+    # 市场资金面（30 分钟缓存）
+    if funds:
+        f = []
+        mf = funds.get("market_main_flow")
+        if mf and mf.get("net_inflow_yi") is not None:
+            pct = f"（占成交 {mf['net_pct']}%）" if mf.get("net_pct") is not None else ""
+            f.append(f"大盘主力净流入 {mf['net_inflow_yi']:+} 亿{pct}（{mf.get('date', '')}）")
+        lhb = funds.get("lhb_top") or []
+        if lhb:
+            tops = "、".join(
+                f"{x['name']}({x['code']}) 净买 {x['net_buy_yi']} 亿" for x in lhb[:3]
+            )
+            f.append(f"最新龙虎榜净买居前：{tops}（{lhb[0].get('date', '')}）")
+        if f:
+            context_parts.append("市场资金面：" + "；".join(f))
+
     if rag.get("context"):
         context_parts.append(f"参考知识：\n{rag['context']}")
 
