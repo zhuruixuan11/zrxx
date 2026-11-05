@@ -2,14 +2,20 @@
 
 [![CI](https://github.com/zhuruixuan11/zrxx/actions/workflows/ci.yml/badge.svg)](https://github.com/zhuruixuan11/zrxx/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-![Python](https://img.shields.io/badge/python-3.12-blue)
-![Node](https://img.shields.io/badge/node-20-blue)
+[![Python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org/)
+[![Node](https://img.shields.io/badge/node-20-blue)](https://nodejs.org/)
+[![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](https://docs.docker.com/)
+[![LangGraph](https://img.shields.io/badge/langgraph-0.2-purple)](https://langchain-ai.github.io/langgraph/)
+
+> **最新迭代（2026.11）**：回测引擎接入新浪 K 线兜底 → baostock 挂起也能跑回测；Agent 新增宏观经济（GDP/CPI/M2/SHIBOR）与市场资金面（主力资金/龙虎榜）数据注入
 
 ## 项目介绍
 
-**衡策（Hengce）** 是一个可完全本地部署、多用户可用的 A 股智能投研平台，把「看盘 → 分析 → 验证 → 跟踪」整条投研链路装进自己的电脑：
+**衡策（Hengce）** 是一个**完全本地部署、多用户可用、数据零 Key 成本**的 A 股智能投研平台。把「看盘 → 分析 → 验证 → 跟踪」整条投研链路装进自己的电脑：
 
-> 全市场选股与真实行情 → AI 基于真实数据做分析 → 一键进回测用历史数据验证 → 模拟持仓与到价预警持续跟踪
+> 5500+ 只 A 股实时行情 → AI 基于真实数据（行情+估值+技术指标+宏观+资金面）做分析 → 一键回测用历史数据验证 → 模拟持仓 + 到价预警持续跟踪
+>
+> **不需要注册任何数据服务，不需要付费订阅，不需要把持仓和提问上传到任何第三方。**
 
 ## 与其他方案对比
 
@@ -63,17 +69,19 @@ flowchart LR
 
 ## 数据链路
 
+所有行情类请求（包括 Agent 问答和**回测引擎**）共享同一套多源兜底策略——baostock 挂起或限流时自动切新浪，25 秒超时防止无限阻塞。
+
 | 数据 | 主源 | 兜底 | 缓存 |
 |---|---|---|---|
-| 日 K 线 | baostock | 新浪（北交所依赖此兜底） | 5 分钟 |
+| 日 K 线（行情 + 回测） | baostock | 新浪（北交所依赖此兜底；baostock 登录失败时也自动降级） | 5 分钟 |
 | 实时快照 | baostock / 东财 push2 | 新浪单股快照 | 30 秒 |
-| 宏观读数 | akshare（国家统计局 / Shibor 官网） | — | 6 小时 |
-| 资金面 | akshare（东财） | — | 30 分钟 |
+| 宏观读数（GDP / CPI / M2 / SHIBOR） | akshare（国家统计局 / Shibor 官网） | — | 6 小时 |
+| 资金面（主力资金 / 龙虎榜） | akshare（东财） | — | 30 分钟 |
 | 选股 / 概念 / 涨停池 | 东财 push2 | — | 启动预热 + 5 分钟 |
 
-- 北交所日线：baostock 不覆盖，自动切换新浪 K 线（`4/8/920` 前缀已识别为北交所）
+- **北交所日线**：baostock 不覆盖，自动切换新浪 K 线（`4/8/920` 前缀已识别为北交所）
 - **北向资金**：2024-08 起交易所停止披露当日净买额，免费源均为死数据，已诚实移除而非给 AI 喂过期数据
-- 以上接口均在国内网络下验证可用；**海外网络访问东财 / 新浪可能超时**，表现为部分行情或 K 线缺失
+- **海外网络**：东财 / 新浪可能超时，表现为部分行情或 K 线缺失
 
 ## 技术栈
 
