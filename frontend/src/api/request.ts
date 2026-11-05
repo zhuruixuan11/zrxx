@@ -36,8 +36,12 @@ instance.interceptors.response.use(
   },
   (err) => {
     const status = err.response?.status
-    // 后端统一返回 {code,msg}；FastAPI 原生错误是 {detail}
-    const msg = err.response?.data?.msg || err.response?.data?.detail || err.message
+    // 后端统一返回 {code,msg}；FastAPI 原生错误是 {detail}；slowapi 限流是 {error}
+    const data = err.response?.data
+    let msg: string = data?.msg || data?.detail || data?.error || err.message
+    if (status === 429) {
+      msg = '请求太频繁了，请稍等片刻再试'
+    }
 
     if (status === 401) {
       localStorage.removeItem('hengce_token')

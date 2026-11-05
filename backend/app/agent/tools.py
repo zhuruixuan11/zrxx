@@ -245,16 +245,48 @@ async def _bs_quote(symbol: str) -> Optional[Dict[str, Any]]:
     # 东方财富实时盘口与 baostock 日线并行，缩短单只行情耗时
     em_task = asyncio.create_task(_em_push2_realtime(bs_code))
     rs = await loop.run_in_executor(None, lambda: _bs_run_in_executor(_do_query))
-    if rs is None or rs.error_code != "0":
-        em_task.cancel()
-        logger.warning(f"baostock quote query failed: {getattr(rs, 'error_msg', 'unknown')}")
-        return None
-
+    bs_failed = rs is None or rs.error_code != "0"
     rows: List[List[str]] = []
-    while rs.next():
-        rows.append(rs.get_row_data())
+    if bs_failed:
+        logger.warning(f"baostock quote query failed: {getattr(rs, 'error_msg', 'unknown')}")
+    else:
+        while rs.next():
+            rows.append(rs.get_row_data())
 
-    if not rows:
+    realtime = await _await_optional(em_task)
+
+    # baostock 不覆盖北交所（4/8/920 开头）等场景：查询失败或无日线时，
+    # 依次用并行的东财快照、新浪实时快照兜底，而不是直接丢弃
+    if bs_failed or not rows:
+        source = ""
+        if realtime and realtime.get("current_price"):
+            source = "eastmoney"
+        else:
+            sina_rt = await _sina_realtime(symbol)
+            if sina_rt:
+                realtime, source = sina_rt, "sina"
+        if source:
+            result: Dict[str, Any] = {
+                "symbol": symbol.upper(),
+                "bs_code": bs_code,
+                "trade_date": _dt.date.today().strftime("%Y-%m-%d"),
+                "current_price": realtime["current_price"],
+                "previous_close": realtime.get("previous_close")
+                or round(realtime["current_price"] - (realtime.get("change") or 0), 2),
+                "open": realtime.get("open"),
+                "high": realtime.get("high"),
+                "low": realtime.get("low"),
+                "volume": int(realtime.get("volume") or 0),
+                "amount": round(realtime.get("amount") or 0.0, 2),
+                "change": realtime.get("change"),
+                "change_percent": realtime.get("change_percent"),
+                "data_source": source,
+                "is_realtime": True,
+            }
+            for k in ("pe", "pb", "total_mv", "circ_mv", "turnover_rate", "volume_ratio"):
+                if realtime.get(k) is not None:
+                    result[k] = realtime[k]
+            return result
         return None
 
     latest = rows[-1]
@@ -272,8 +304,6 @@ async def _bs_quote(symbol: str) -> Optional[Dict[str, Any]]:
     prev_close = safe_float(prev, 4) or close
     change = round(close - prev_close, 2)
     change_pct = round(change / prev_close * 100, 2) if prev_close else 0
-
-    realtime = await _await_optional(em_task)
 
     result = {
         "symbol": symbol.upper(),
@@ -351,6 +381,45 @@ async def _bs_history(symbol: str, days: int = 30) -> Optional[Dict[str, Any]]:
     }
 
 
+async def _sina_realtime(symbol: str) -> Optional[Dict[str, Any]]:
+    """新浪实时快照兜底（覆盖沪深北三市）。baostock/东财都不可用时使用。"""
+    bs_code = normalize_a_share(symbol)
+    if not bs_code:
+        return None
+    sina_code = bs_code.replace(".", "")  # sh600519 / bj920819
+    try:
+        async with httpx.AsyncClient(
+            timeout=5,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn"},
+        ) as client:
+            resp = await client.get(f"https://hq.sinajs.cn/list={sina_code}")
+            text = resp.text
+    except Exception as e:
+        logger.warning(f"sina realtime failed {symbol}: {e}")
+        return None
+    # var hq_str_sh600519="名称,今开,昨收,最新,最高,最低,买一价,卖一价,成交量(股),成交额,...";
+    try:
+        payload = text.split('"')[1]
+        f = payload.split(",")
+        if len(f) < 10 or not f[3]:
+            return None
+        price = float(f[3])
+        prev = float(f[2]) or price
+        return {
+            "current_price": round(price, 2),
+            "open": round(float(f[1]), 2),
+            "previous_close": round(prev, 2),
+            "high": round(float(f[4]), 2),
+            "low": round(float(f[5]), 2),
+            "volume": int(float(f[8] or 0)),
+            "amount": round(float(f[9] or 0), 2),
+            "change": round(price - prev, 2),
+            "change_percent": round((price - prev) / prev * 100, 2) if prev else 0.0,
+        }
+    except (ValueError, IndexError):
+        return None
+
+
 async def _sina_kline(symbol: str, days: int = 30) -> Optional[Dict[str, Any]]:
     """新浪日 K 兜底：覆盖北交所，且 baostock 返回空时可用。"""
     bs_code = normalize_a_share(symbol)
@@ -422,7 +491,7 @@ async def _em_push2_realtime(bs_code: str) -> Dict[str, Any]:
     except ImportError:
         return {}
 
-    # baostock sh.600519 → 东方财富 1.600519 / 0.000001 / 2.830799
+    # baostock sh.600519 → 东方财富 1.600519 / 0.000001 / 0.920819（北交所同为 0 前缀）
     market_map = {"sh": "1", "sz": "0", "bj": "0"}
     prefix, code = bs_code.split(".")
     secid = f"{market_map.get(prefix, '0')}.{code}"

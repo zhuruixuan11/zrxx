@@ -16,6 +16,8 @@ services:
       DATABASE_URL: sqlite+aiosqlite:////data/hengce.db
       LOG_FILE: /data/logs/hengce.log
       CORS_ORIGINS: '["http://localhost:8080"]'
+      # 部署环境强制关闭调试模式（即使 .env 里写了 true）
+      DEBUG: "false"
     volumes:
       - hengce-data:/data
     ports:

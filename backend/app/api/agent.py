@@ -1,5 +1,7 @@
 """Agent 对话 API。"""
 import asyncio
+import time
+from collections import OrderedDict
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, Request
@@ -14,6 +16,11 @@ from ..models.user import User
 from ..security import get_current_user
 
 limiter = Limiter(key_func=lambda request: get_ipaddr(request))
+
+# 相同问题 10 分钟内直接复用上一次回答，避免重复调 LLM（LRU 上限防内存增长）
+_ANSWER_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()  # (user_id, 归一化问题) -> (ts, data)
+_ANSWER_TTL = 600.0
+_ANSWER_MAX = 128
 
 
 class ChatRequest(BaseModel):
@@ -36,6 +43,15 @@ async def chat(req: ChatRequest, request: Request, user: User = Depends(get_curr
     from ..agent.memory import save_message
     if not req.message.strip():
         return {"code": 400, "msg": "消息不能为空"}
+
+    # 相同问题命中缓存时直接返回（不重复写聊天记录、不重复调 LLM）
+    cache_key = (user.id, " ".join(req.message.split()))
+    hit = _ANSWER_CACHE.get(cache_key)
+    if hit is not None:
+        if time.monotonic() - hit[0] <= _ANSWER_TTL:
+            _ANSWER_CACHE.move_to_end(cache_key)
+            return {"code": 0, "msg": "ok", "data": {**hit[1], "cached": True}}
+        _ANSWER_CACHE.pop(cache_key, None)
 
     async with async_session() as session:
         # 保存用户消息
@@ -65,17 +81,22 @@ async def chat(req: ChatRequest, request: Request, user: User = Depends(get_curr
         )
         await session.commit()
 
-    return {
-        "code": 0, "msg": "ok",
-        "data": {
-            "response": result.get("response", ""),
-            "response_type": result.get("response_type", "text"),
-            "intent": result.get("intent"),
-            "confidence": result.get("intent_confidence"),
-            "needs_clarification": result.get("needs_clarification", False),
-            "sources": result.get("rag_sources", []),
-        },
+    data = {
+        "response": result.get("response", ""),
+        "response_type": result.get("response_type", "text"),
+        "intent": result.get("intent"),
+        "confidence": result.get("intent_confidence"),
+        "needs_clarification": result.get("needs_clarification", False),
+        "sources": result.get("rag_sources", []),
     }
+    # 只缓存成功回答；超时兜底是暂态，不缓存
+    if result.get("response_type") != "timeout":
+        _ANSWER_CACHE[cache_key] = (time.monotonic(), data)
+        _ANSWER_CACHE.move_to_end(cache_key)
+        while len(_ANSWER_CACHE) > _ANSWER_MAX:
+            _ANSWER_CACHE.popitem(last=False)
+
+    return {"code": 0, "msg": "ok", "data": data}
 
 
 @router.get("/history")
