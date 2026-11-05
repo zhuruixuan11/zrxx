@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f6c453"/>
+      <stop offset="50%" stop-color="#e8921f"/>
+      <stop offset="100%" stop-color="#b8560d"/>
+    </linearGradient>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1a1a2e"/>
+      <stop offset="100%" stop-color="#16213e"/>
+    </linearGradient>
+  </defs>
+  <!-- 背景圆 -->
+  <circle cx="512" cy="512" r="480" fill="url(#bg)"/>
+  <!-- 外圆环（衡：度量） -->
+  <circle cx="512" cy="512" r="420" fill="none" stroke="url(#g)" stroke-width="4" opacity="0.3"/>
+  <circle cx="512" cy="512" r="390" fill="none" stroke="url(#g)" stroke-width="2" opacity="0.2"/>
+  <!-- K线（策：策略） -->
+  <!-- 第一根K线 -->
+  <line x1="260" y1="720" x2="260" y2="540" stroke="url(#g)" stroke-width="3"/>
+  <rect x="235" y="600" width="50" height="80" fill="url(#g)" rx="4"/>
+  <!-- 第二根 -->
+  <line x1="370" y1="580" x2="370" y2="400" stroke="url(#g)" stroke-width="3"/>
+  <rect x="345" y="460" width="50" height="70" fill="url(#g)" rx="4"/>
+  <!-- 第三根（大阳线） -->
+  <line x1="480" y1="480" x2="480" y2="260" stroke="#f6c453" stroke-width="4"/>
+  <rect x="455" y="320" width="50" height="140" fill="#f6c453" rx="4"/>
+  <!-- 第四根 -->
+  <line x1="590" y1="400" x2="590" y2="220" stroke="#f6c453" stroke-width="4"/>
+  <rect x="565" y="280" width="50" height="100" fill="#f6c453" rx="4"/>
+  <!-- 第五根 -->
+  <line x1="700" y1="340" x2="700" y2="160" stroke="#f6c453" stroke-width="4"/>
+  <rect x="675" y="220" width="50" height="90" fill="#f6c453" rx="4"/>
+  <!-- 趋势线 -->
+  <line x1="200" y1="780" x2="820" y2="140" stroke="url(#g)" stroke-width="2" stroke-dasharray="8,6" opacity="0.6"/>
+  <!-- 中心光点 -->
+  <circle cx="512" cy="512" r="8" fill="#f6c453"/>
+  <circle cx="512" cy="512" r="20" fill="#f6c453" opacity="0.2"/>
+  <!-- 底部文字 -->
+  <text x="512" y="940" text-anchor="middle" font-family="'Microsoft YaHei', sans-serif" font-size="56" font-weight="700" fill="url(#g)">衡策</text>
+  <text x="512" y="990" text-anchor="middle" font-family="sans-serif" font-size="20" fill="#8892b0" letter-spacing="8">HENG · CE</text>
+</svg>

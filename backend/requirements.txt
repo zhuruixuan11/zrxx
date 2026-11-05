@@ -1,0 +1,45 @@
+# ============ FastAPI 后端 ============
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+httpx>=0.27.0
+
+# ============ LangGraph + LangChain (Agent 核心) ============
+langgraph>=0.2.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+
+# ============ 数据库 ============
+# sqlalchemy[asyncio] 会带上 greenlet，缺少它 AsyncSession 无法 import（容器镜像必须显式声明）
+sqlalchemy[asyncio]>=2.0.27
+aiosqlite>=0.19.0
+
+# ============ 安全 & 鉴权 ============
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+# passlib 1.7.4 与 bcrypt 5.x 不兼容（校验时抛 ValueError: password cannot be longer than 72 bytes），锁定 4.x
+bcrypt>=4.0.1,<5.0
+slowapi
+
+# ============ LLM 客户端 ============
+# DeepSeek / OpenAI / 阿里通义 三选一或多选；未配置 API Key 时后端自动进入 Mock 模式
+python-dotenv>=1.0.1
+
+# ============ A 股数据源（核心，全部免费）============
+baostock>=0.9.4
+akshare>=1.12.0
+feedparser>=6.0.10
+numpy>=1.24.0
+aiohttp>=3.9.0
+
+# ============ 基础设施 ============
+loguru>=0.7.2
+pydantic[email]>=2.6.0
+pydantic-settings>=2.2.0
+
+# ============ 美股行情（延迟 import，缺失时仅美股相关功能不可用）============
+yfinance>=0.2.40
+
+# ============ 可选（RAG 向量库）========
+# 先用本地 JSON + 关键词检索，避免 chromadb 安装重量
+# 需要时再：pip install chromadb sentence-transformers

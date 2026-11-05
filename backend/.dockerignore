@@ -1,0 +1,9 @@
+# 构建镜像时不需要打进数据库、日志与本地测试脚本
+.env
+logs/
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+.pytest_cache/
+tests/

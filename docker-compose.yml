@@ -1,0 +1,42 @@
+# 一键部署：docker compose up -d --build
+# 访问 http://localhost:8080（前端 nginx 同时代理 /api 到后端，同源无 CORS）
+#
+# 首次部署前必须确认 backend/.env：
+#   1) JWT_SECRET_KEY 换成随机串（python -c "import secrets;print(secrets.token_urlsafe(48))"）
+#   2) LLM_PROVIDER / API Key 按需填写
+#   3) SMTP_* 需要邮件推送时填写
+services:
+  backend:
+    build:
+      context: ./backend
+    env_file:
+      - ./backend/.env
+    environment:
+      # 容器内绝对路径，数据落在命名卷里，重建容器不丢
+      DATABASE_URL: sqlite+aiosqlite:////data/hengce.db
+      LOG_FILE: /data/logs/hengce.log
+      CORS_ORIGINS: '["http://localhost:8080"]'
+    volumes:
+      - hengce-data:/data
+    ports:
+      # 仅绑定本机，便于调试接口；对外只需要暴露 frontend 的 8080
+      - "127.0.0.1:8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8001/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+volumes:
+  hengce-data:
