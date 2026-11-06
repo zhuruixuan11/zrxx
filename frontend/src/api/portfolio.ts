@@ -14,4 +14,22 @@ export const portfolioApi = {
   trades() {
     return request.get<{ list: Trade[]; total: number }>('/api/portfolio/trades')
   },
+
+  /** 从回测结果一键开模拟仓（取 trades 里首笔 BUY） */
+  fromBacktest(payload: {
+    symbol: string
+    strategy: string
+    trades: Array<{ action: string; price: number; shares: number; [key: string]: any }>
+    initial_capital?: number
+    notes?: string
+  }) {
+    return request.post<{
+      symbol: string
+      shares: number
+      price: number
+      total_amount: number
+      portfolio_cash: number
+      notes: string
+    }>('/api/portfolio/from-backtest', payload)
+  },
 }

@@ -31,6 +31,7 @@ from .nodes import (
     node_market,
     node_portfolio,
     node_risk,
+    node_screener,
     route_by_intent,
 )
 from .state import AgentState
@@ -50,13 +51,14 @@ def build_graph():
     graph.add_node("chitchat", node_chitchat)
     graph.add_node("risk", node_risk)
     graph.add_node("alert", node_alert)
+    graph.add_node("screener", node_screener)
 
     graph.set_entry_point("classify")
     graph.add_conditional_edges("classify", route_by_intent)
 
     # 所有叶子节点 → END
     for n in ("clarification", "portfolio", "market", "analysis",
-              "knowledge", "chitchat", "risk", "alert"):
+              "knowledge", "chitchat", "risk", "alert", "screener"):
         graph.add_edge(n, END)
 
     return graph.compile()

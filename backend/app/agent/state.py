@@ -11,12 +11,14 @@ class IntentType(str):
     CHITCHAT = "chitchat"
     RISK_ASSESSMENT = "risk_assessment"
     ALERT_CONFIG = "alert_config"
+    SCREENER = "screener"  # 按信号选股（全市场扫描）
 
 
 INTENT_LIST = [
     IntentType.PORTFOLIO_QUERY, IntentType.MARKET_QUERY,
     IntentType.INVESTMENT_ANALYSIS, IntentType.KNOWLEDGE_QUERY,
     IntentType.CHITCHAT, IntentType.RISK_ASSESSMENT, IntentType.ALERT_CONFIG,
+    IntentType.SCREENER,
 ]
 
 

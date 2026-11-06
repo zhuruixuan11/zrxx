@@ -15,6 +15,8 @@ from .state import IntentType, INTENT_LIST
 # ========== 关键词规则（轻量兜底，Mock/LLM 失败时用）========
 # 顺序 = 优先级（越具体/匹配越精准的意图越靠前）
 _KEYWORD_RULES: list[tuple[str, list[str]]] = [
+    # 按信号选股（最具体 → 放最前）
+    (IntentType.SCREENER,         ["选出", "筛选", "找几只", "找些", "选股", "扫描", "全市场", "金叉股票", "金叉的", "超卖股票", "超卖的", "放量的", "锤子线", "突破股票", "选出几只", "帮我筛"]),
     (IntentType.PORTFOLIO_QUERY,  ["投资组合", "我的组合", "组合", "持仓", "总资产", "我的资产", "盈亏", "收益", "赚多少", "亏多少", "portfolio", "holding"]),
     (IntentType.MARKET_QUERY,     ["行情", "股价", "涨跌", "走势", "K线", "最新价", "现在多少", "收盘价", "开盘价", "market", "quote"]),
     # 市场环境 / 宏观与资金面：这类问题不需要股票代码，走分析流程注入宏观数据
@@ -63,6 +65,7 @@ async def classify_intent_llm(message: str, llm_client) -> Tuple[str, float]:
     prompt = f"""你是一个意图识别引擎。根据用户的输入，从以下意图中选一个最合适的，并给出置信度（0.0-1.0）。
 
 可选意图：
+- screener: 按策略信号/技术指标从全市场选股（如选出金叉的、筛超卖的、找放量股票）
 - portfolio_query: 查询投资组合/持仓/资产/盈亏
 - market_query: 查询股票/基金行情、股价、走势
 - investment_analysis: 对某只股票/基金做投资分析建议
@@ -97,6 +100,7 @@ async def classify_intent_llm(message: str, llm_client) -> Tuple[str, float]:
 def pick_clarification_question(intent_a: str, intent_b: str) -> str:
     """两种可能意图时生成澄清问题。"""
     label = {
+        IntentType.SCREENER: "按策略信号从全市场选股",
         IntentType.PORTFOLIO_QUERY: "查看投资组合/持仓",
         IntentType.MARKET_QUERY: "查询股票行情",
         IntentType.INVESTMENT_ANALYSIS: "获取投资分析建议",

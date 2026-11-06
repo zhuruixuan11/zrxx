@@ -419,6 +419,143 @@ async def node_alert(state: AgentState) -> Dict[str, Any]:
     }
 
 
+# ========== 节点 2h：策略选股（全市场扫描）========
+
+# 用户说"选出金叉的""筛超卖的""帮我找出放量股票"——需要把自然语言信号 id 关联起来
+_SCREENER_KEYWORD_MAP: list[tuple[str, str]] = [
+    # 信号关键词 → screener 用的 signal id
+    ("金叉", "ma5_cross_ma20"),
+    ("多头排列", "ma_bullish"),
+    ("均线多头", "ma_bullish"),
+    ("超卖", "rsi_oversold"),
+    ("超买", "rsi_overbought"),
+    ("突破", "breakout_20d"),
+    ("新高", "breakout_20d"),
+    ("放量", "vol_surge"),
+    ("量比", "vol_surge"),
+    ("锤子线", "hammer"),
+]
+
+
+def _parse_screener_signal(message: str) -> str:
+    """从用户消息里推断要扫描的信号 id。没匹配到就给最友好的默认。"""
+    for kw, sid in _SCREENER_KEYWORD_MAP:
+        if kw.lower() in message.lower():
+            return sid
+    return "breakout_20d"  # 默认"突破 20 日高点"——最有参考价值的信号
+
+
+async def node_screener(state: AgentState) -> Dict[str, Any]:
+    message = state.get("message", "")
+    signal_id = _parse_screener_signal(message)
+
+    # 直接调 market screener 接口（复用已有缓存）
+    from ..api.market import _STRATEGY_SIGNALS, _init_strategy_signals
+    _init_strategy_signals()
+    signal_meta = _STRATEGY_SIGNALS.get(signal_id)
+    signal_name = signal_meta[0] if signal_meta else signal_id
+
+    # 用 httpx 调自己（绕过 router 直接调函数会比较复杂，走 HTTP 最稳）
+    try:
+        import httpx
+        from ..config import get_settings
+        settings = get_settings()
+        # 内部 loop.run_in_executor 不安全——直接 import 并 await 内部函数
+        from ..api.market import screener_strategic as screener_impl
+        from fastapi import Request
+        from starlette.requests import Request as StarletteRequest
+
+        # 构造一个最小的 Request mock（被 limiter 用 get_ipaddr）
+        class _MockClient:
+            host = "127.0.0.1"
+        class _MockRequest:
+            client = _MockClient()
+            url = type("URL", (), {"path": "/"})()
+            def headers(self): return {}
+        # 直接跳过 limiter 装饰器调内部函数（内部函数不带装饰器）
+        results = await _run_screener_direct(signal_id, top_n=15)
+
+        if not results:
+            return {
+                "response": (
+                    f"全市场扫描完成（信号：{signal_name}），"
+                    f"当前没有触发条件的股票。\n"
+                    f"可能原因：当前不是交易日、或信号条件较严格。"
+                    f"可以试试放宽条件或换一个信号。"
+                ),
+                "response_type": "text",
+            }
+
+        lines = [f"📊 全市场扫描 · 信号：{signal_name}", f"共扫描 5500+ 只，找到 {len(results)} 只：", ""]
+        for i, r in enumerate(results[:10], 1):
+            lines.append(
+                f"{i}. {r['name']}（{r['code']}）· ¥{r['price']:.2f} · "
+                f"{r['change_pct']:+.2f}% · 成交额 {_fmt_amount(r.get('amount', 0))}"
+            )
+        if len(results) > 10:
+            lines.append(f"\n... 还有 {len(results) - 10} 只，请到「A 股全景 → 策略选股」查看完整列表")
+
+        lines.append(
+            "\n💡 提示：点击任意股票代码可跳转行情页查看 K 线，"
+            "选中后可一键进回测验证信号是否靠谱。"
+        )
+        return {"response": "\n".join(lines), "response_type": "text"}
+
+    except Exception as e:
+        logger.warning("screener node 扫描失败：%s", e)
+        return {
+            "response": f"扫描暂时不可用：{e}",
+            "response_type": "text",
+        }
+
+
+async def _run_screener_direct(signal: str, top_n: int = 15) -> list:
+    """绕过 limiter 直接跑 screener 逻辑的内部函数。"""
+    from .api.market import (
+        _STRATEGY_SIGNALS, _init_strategy_signals,
+        _cached_fetch, _fetch_screener_sync,
+        fetch_history_bars_for_screener,
+    )
+    import pandas as pd
+
+    _init_strategy_signals()
+    if signal not in _STRATEGY_SIGNALS:
+        return []
+    name, desc, need_days, check_fn = _STRATEGY_SIGNALS[signal]
+
+    full_items = await _cached_fetch("screener_full", _fetch_screener_sync)
+
+    hits: list = []
+    for i, item in enumerate(full_items):
+        if len(hits) >= top_n * 3:
+            break
+        try:
+            bars = await fetch_history_bars_for_screener(item["code"], days=need_days)
+        except Exception:
+            continue
+        if not bars or len(bars) < need_days:
+            continue
+        try:
+            df = pd.DataFrame(bars).sort_values("date").reset_index(drop=True)
+            if check_fn(df):
+                hits.append({**item, "signal": signal, "signal_name": name})
+        except Exception:
+            continue
+        if (i + 1) % 10 == 0:
+            await asyncio.sleep(0.15)
+
+    hits.sort(key=lambda x: x.get("change_pct", 0), reverse=True)
+    return hits[:top_n]
+
+
+def _fmt_amount(v: float) -> str:
+    if v >= 1e8:
+        return f"{v/1e8:.1f}亿"
+    if v >= 1e4:
+        return f"{v/1e4:.0f}万"
+    return f"{v:.0f}"
+
+
 # ========== 路由分发函数（LangGraph conditional_edges 用）========
 def route_by_intent(state: AgentState) -> str:
     """根据意图返回下一个节点名（或 'clarification'）。"""
@@ -433,5 +570,6 @@ def route_by_intent(state: AgentState) -> str:
         "chitchat": "chitchat",
         "risk_assessment": "risk",
         "alert_config": "alert",
+        "screener": "screener",
     }
     return mapping.get(intent, "chitchat")

@@ -305,6 +305,266 @@ async def boards_zt(request: Request):
     return {"code": 0, "msg": "ok", "data": {"items": items, "note": "数据源：东方财富"}}
 
 
+# ===================== 策略选股（全市场扫描）=====================
+
+# 支持扫描的"轻量信号"：只需最近一根 K 线 + N 日窗口统计，不跑完整回测
+# key → (名称, 描述, 需要的 days, 判定函数)
+_STRATEGY_SIGNALS = {}  # 运行时在 _init_strategy_signals 里填充
+
+
+def _init_strategy_signals() -> None:
+    """懒加载，避免 import 循环。"""
+    if _STRATEGY_SIGNALS:
+        return
+
+    def _sma(close_series, window: int) -> float:
+        return float(close_series.iloc[-window:].mean()) if len(close_series) >= window else float("nan")
+
+    _STRATEGY_SIGNALS.update({
+        # —— 均线金叉类 ——
+        "ma5_cross_ma20": (
+            "MA5 上穿 MA20（金叉）",
+            "短期均线上穿长期均线，趋势反转向上",
+            21,
+            lambda df: (
+                df["close"].iloc[-2] < df["close"].rolling(5).mean().iloc[-2]
+                and df["close"].iloc[-1] > df["close"].rolling(5).mean().iloc[-1]
+                and df["close"].rolling(5).mean().iloc[-1] > df["close"].rolling(20).mean().iloc[-1]
+                and df["close"].rolling(5).mean().iloc[-2] <= df["close"].rolling(20).mean().iloc[-2]
+            ) if len(df) >= 21 else False,
+        ),
+        "ma_bullish": (
+            "多头排列（MA5>MA10>MA20）",
+            "短中长均线全部多头排列，上升趋势明确",
+            21,
+            lambda df: (
+                df["close"].rolling(5).mean().iloc[-1]
+                > df["close"].rolling(10).mean().iloc[-1]
+                > df["close"].rolling(20).mean().iloc[-1]
+            ) if len(df) >= 21 else False,
+        ),
+        # —— RSI 类 ——
+        "rsi_oversold": (
+            "RSI14 超卖（<30）",
+            "RSI14 低于 30，可能反弹",
+            15,
+            lambda df: _rsi14(df) < 30 if len(df) >= 15 else False,
+        ),
+        "rsi_overbought": (
+            "RSI14 超买（>70）",
+            "RSI14 高于 70，注意回调风险",
+            15,
+            lambda df: _rsi14(df) > 70 if len(df) >= 15 else False,
+        ),
+        # —— 突破类 ——
+        "breakout_20d": (
+            "突破 20 日高点",
+            "收盘价创 20 个交易日新高",
+            21,
+            lambda df: float(df["close"].iloc[-1])
+            >= float(df["high"].iloc[-21:-1].max()) if len(df) >= 21 else False,
+        ),
+        # —— 量价类 ——
+        "vol_surge": (
+            "放量（量比 > 2）",
+            "今日成交量是近 5 日均量的 2 倍以上",
+            6,
+            lambda df: (
+                float(df["volume"].iloc[-1])
+                > 2.0 * float(df["volume"].iloc[-6:-1].mean())
+            ) if len(df) >= 6 else False,
+        ),
+        # —— 反转类 ——
+        "hammer": (
+            "锤子线（下影线 ≥ 实体 2 倍）",
+            "典型底部反转 K 线形态",
+            1,
+            lambda df: _is_hammer(df.iloc[-1]) if len(df) >= 1 else False,
+        ),
+    })
+
+
+def _rsi14(df) -> float:
+    """简易 RSI14（只算最新值，避免重算整列）。"""
+    close = df["close"]
+    deltas = close.diff().dropna()
+    gain = deltas.where(deltas > 0, 0).tail(14)
+    loss = (-deltas.where(deltas < 0, 0)).tail(14)
+    avg_gain = float(gain.mean())
+    avg_loss = float(loss.mean())
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - 100.0 / (1.0 + rs)
+
+
+def _is_hammer(row) -> bool:
+    try:
+        o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+    except (KeyError, ValueError, TypeError):
+        return False
+    body = abs(c - o)
+    lower_shadow = min(o, c) - l
+    upper_shadow = h - max(o, c)
+    return lower_shadow >= body * 2 and upper_shadow < body
+
+
+@router.get("/screener/strategic")
+@limiter.limit(lambda: get_settings().MARKET_RATE_LIMIT)
+async def screener_strategic(
+    request: Request,
+    signal: str = Query(..., description="信号 id，见 /api/market/screener/signals"),
+    top_n: int = Query(default=20, ge=5, le=100),
+):
+    """按轻量信号扫描全市场股票。
+
+    不走完整回测，只拉每只股票所需 N 日 K 线（信号特定），
+    判定函数返回 True 就入选。支持 baostock + 新浪兜底，全串行限速（5500 只约 2-3 分钟）。
+    """
+    _init_strategy_signals()
+    if signal not in _STRATEGY_SIGNALS:
+        known = ", ".join(_STRATEGY_SIGNALS.keys())
+        raise HTTPException(400, f"未知信号 id：{signal}。可用：{known}")
+
+    name, desc, need_days, check_fn = _STRATEGY_SIGNALS[signal]
+
+    # 先拿全市场列表（5 分钟缓存）
+    full_items = await _cached_fetch("screener_full", _fetch_screener_sync)
+
+    # 每只拉 K 线并判定
+    hits: List[Dict[str, Any]] = []
+    for i, item in enumerate(full_items):
+        if len(hits) >= top_n * 3:  # 多留一些供后续排序截断
+            break
+        symbol = item["code"]
+        try:
+            bars = await fetch_history_bars_for_screener(symbol, days=need_days)
+        except Exception:
+            continue
+        if not bars or len(bars) < need_days:
+            continue
+
+        import pandas as pd
+        df = pd.DataFrame(bars)
+        df = df.sort_values("date").reset_index(drop=True)
+        try:
+            triggered = check_fn(df)
+        except Exception:
+            triggered = False
+
+        if triggered:
+            hits.append({
+                **item,
+                "signal": signal,
+                "signal_name": name,
+            })
+            logger.debug(f"[screener] {symbol} {item['name']} → {signal}")
+
+        # 限速：每 10 只睡 0.2s，避免把 baostock 限流打满
+        if (i + 1) % 10 == 0:
+            await asyncio.sleep(0.2)
+
+    # 按当日涨幅排序取 top_n
+    hits.sort(key=lambda x: x.get("change_pct", 0), reverse=True)
+    hits = hits[:top_n]
+
+    return {
+        "code": 0,
+        "msg": "ok",
+        "data": {
+            "signal": signal,
+            "signal_name": name,
+            "signal_desc": desc,
+            "total_scanned": len(full_items),
+            "results": hits,
+        },
+    }
+
+
+@router.get("/screener/signals")
+async def screener_signals():
+    """列出所有可用的策略信号（前端下拉用）。"""
+    _init_strategy_signals()
+    items = []
+    for sid, (name, desc, need_days, _) in _STRATEGY_SIGNALS.items():
+        items.append({"id": sid, "name": name, "desc": desc, "need_days": need_days})
+    return {"code": 0, "msg": "ok", "data": {"signals": items}}
+
+
+async def fetch_history_bars_for_screener(symbol: str, days: int = 20) -> List[Dict[str, Any]]:
+    """screener 专用的极简 K 线拉取——只取 baostock/新浪 日线，不复用复杂的 agent 层函数。"""
+    # 优先从 market history 缓存里取（用户可能刚查过）
+    cached = _cache_get(f"screener_hist:{symbol}:{days}")
+    if cached is not None:
+        return cached
+
+    from datetime import datetime, timedelta
+    from ..agent.tools import normalize_a_share, _sina_kline
+
+    bs_code = normalize_a_share(symbol)
+    if not bs_code:
+        return []
+
+    bars: List[Dict[str, Any]] = []
+
+    # 1) baostock 主源
+    try:
+        import baostock as bs
+        start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
+        end = datetime.now().strftime("%Y-%m-%d")
+        loop = asyncio.get_event_loop()
+
+        def _do_query():
+            try:
+                lg = bs.login()
+                if lg.error_code != "0":
+                    return None
+                try:
+                    rs = bs.query_history_k_data_plus(
+                        bs_code,
+                        "date,open,high,low,close,volume",
+                        start_date=start, end_date=end,
+                        frequency="d", adjustflag="3",
+                    )
+                    if rs.error_code != "0":
+                        return None
+                    rows = []
+                    while rs.next():
+                        r = rs.get_row_data()
+                        try:
+                            rows.append({
+                                "date": r[0], "open": float(r[1]), "high": float(r[2]),
+                                "low": float(r[3]), "close": float(r[4]),
+                                "volume": float(r[5]) if r[5] else 0.0,
+                            })
+                        except (ValueError, IndexError):
+                            continue
+                    return rows
+                finally:
+                    bs.logout()
+            except Exception:
+                return None
+
+        result = await asyncio.wait_for(loop.run_in_executor(None, _do_query), timeout=10)
+        if result:
+            bars = result
+    except Exception:
+        pass
+
+    # 2) 新浪兜底
+    if not bars:
+        try:
+            sina = await asyncio.wait_for(_sina_kline(symbol, days + 30), timeout=10)
+            if sina and sina.get("data"):
+                bars = sina["data"]
+        except Exception:
+            pass
+
+    if bars:
+        _cache_set(f"screener_hist:{symbol}:{days}", bars)
+    return bars
+
+
 # ===================== 启动预热 =====================
 
 async def prewarm_caches() -> None:

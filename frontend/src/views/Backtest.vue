@@ -95,6 +95,16 @@
           <el-icon><CollectionTag /></el-icon>
           保存到历史
         </el-button>
+        <el-button
+          size="small"
+          type="success"
+          :loading="openingPortfolio"
+          :disabled="!hasBuySignal"
+          @click="openFromBacktest"
+        >
+          <el-icon><Briefcase /></el-icon>
+          一键开模拟仓
+        </el-button>
       </div>
       <!-- 指标卡 -->
       <el-row :gutter="16" class="cards" style="margin-top: 16px">
@@ -287,9 +297,9 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Promotion, InfoFilled } from '@element-plus/icons-vue'
+import { Promotion, InfoFilled, Briefcase } from '@element-plus/icons-vue'
 import {
   backtestApi,
   type BacktestHistoryDetail,
@@ -297,6 +307,9 @@ import {
   type BacktestResult,
   type StrategyInfo,
 } from '@/api/backtest'
+import { portfolioApi } from '@/api/portfolio'
+
+const router = useRouter()
 
 const running = ref(false)
 const result = ref<BacktestResult | null>(null)
@@ -370,6 +383,43 @@ async function runBacktest() {
     result.value = null
   } finally {
     running.value = false
+  }
+}
+
+const openingPortfolio = ref(false)
+
+const hasBuySignal = computed(() =>
+  !!result.value?.trades?.some(t => t.action === 'BUY'),
+)
+
+async function openFromBacktest() {
+  if (!result.value || !hasBuySignal.value) return
+  const firstBuy = result.value.trades.find(t => t.action === 'BUY')!
+  try {
+    await ElMessageBox.confirm(
+      `将按回测首笔买入信号开模拟仓：
+${result.value.symbol} · ${firstBuy.shares} 股 · ¥${firstBuy.price.toFixed(2)}/股
+总金额 ¥${(firstBuy.shares * firstBuy.price).toFixed(2)}`,
+      '一键开模拟仓',
+      { type: 'info', confirmButtonText: '确认开仓', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  openingPortfolio.value = true
+  try {
+    const res = await portfolioApi.fromBacktest({
+      symbol: result.value.symbol,
+      strategy: result.value.strategy,
+      trades: result.value.trades,
+      initial_capital: form.initial_capital,
+    })
+    ElMessage.success(`模拟仓已创建：${res.shares} 股 @ ¥${res.price.toFixed(2)}`)
+    router.push('/portfolio')
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || '开仓失败')
+  } finally {
+    openingPortfolio.value = false
   }
 }
 
