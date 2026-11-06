@@ -510,12 +510,13 @@ async def node_screener(state: AgentState) -> Dict[str, Any]:
 
 
 async def _run_screener_direct(signal: str, top_n: int = 15) -> list:
-    """绕过 limiter 直接跑 screener 逻辑的内部函数。"""
-    from .api.market import (
+    """绕过 limiter 直接跑 screener 逻辑的内部函数（走批量 baostock 查询）。"""
+    from ..api.market import (
         _STRATEGY_SIGNALS, _init_strategy_signals,
         _cached_fetch, _fetch_screener_sync,
-        fetch_history_bars_for_screener,
+        _bs_query_batch, _cache_get, _cache_set,
     )
+    from ..agent.tools import normalize_a_share
     import pandas as pd
 
     _init_strategy_signals()
@@ -525,24 +526,49 @@ async def _run_screener_direct(signal: str, top_n: int = 15) -> list:
 
     full_items = await _cached_fetch("screener_full", _fetch_screener_sync)
 
+    bs_groups: list[tuple[str, dict]] = []
+    for item in full_items:
+        bc = normalize_a_share(item["code"])
+        if bc:
+            bs_groups.append((bc, item))
+
+    _BATCH_SIZE = 80
+    _MAX_SCAN = min(len(bs_groups), 2000)
     hits: list = []
-    for i, item in enumerate(full_items):
+
+    for batch_start in range(0, _MAX_SCAN, _BATCH_SIZE):
         if len(hits) >= top_n * 3:
             break
-        try:
-            bars = await fetch_history_bars_for_screener(item["code"], days=need_days)
-        except Exception:
-            continue
-        if not bars or len(bars) < need_days:
-            continue
-        try:
-            df = pd.DataFrame(bars).sort_values("date").reset_index(drop=True)
-            if check_fn(df):
-                hits.append({**item, "signal": signal, "signal_name": name})
-        except Exception:
-            continue
-        if (i + 1) % 10 == 0:
-            await asyncio.sleep(0.15)
+        batch = bs_groups[batch_start : batch_start + _BATCH_SIZE]
+
+        uncached = []
+        cached_bars: dict[str, list] = {}
+        for bc, _ in batch:
+            cb = _cache_get(f"screener_hist:{bc}:{need_days}")
+            if cb is not None:
+                cached_bars[bc] = cb
+            else:
+                uncached.append(bc)
+
+        if uncached:
+            batch_result = await _bs_query_batch(uncached, need_days)
+            for bc, bars in batch_result.items():
+                _cache_set(f"screener_hist:{bc}:{need_days}", bars)
+            cached_bars.update(batch_result)
+            await asyncio.sleep(0.1)
+
+        for bc, item in batch:
+            if len(hits) >= top_n * 3:
+                break
+            bars = cached_bars.get(bc)
+            if not bars or len(bars) < need_days:
+                continue
+            try:
+                df = pd.DataFrame(bars).sort_values("date").reset_index(drop=True)
+                if check_fn(df):
+                    hits.append({**item, "signal": signal, "signal_name": name})
+            except Exception:
+                continue
 
     hits.sort(key=lambda x: x.get("change_pct", 0), reverse=True)
     return hits[:top_n]

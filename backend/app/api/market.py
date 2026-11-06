@@ -431,38 +431,56 @@ async def screener_strategic(
     # 先拿全市场列表（5 分钟缓存）
     full_items = await _cached_fetch("screener_full", _fetch_screener_sync)
 
-    # 每只拉 K 线并判定
+    # 批量查 K 线：分块 + baostock 一次 login 多只 query（比单只快 10x+）
+    from ..agent.tools import normalize_a_share
+    bs_groups: list[tuple[str, dict]] = []  # (bs_code, item_dict)
+    for item in full_items:
+        bc = normalize_a_share(item["code"])
+        if bc:
+            bs_groups.append((bc, item))
+
+    _BATCH_SIZE = 80
+    _MAX_SCAN = min(len(bs_groups), 2000)  # 先扫前 2000 只（沪深 + 热门，北交所放后面）
     hits: List[Dict[str, Any]] = []
-    for i, item in enumerate(full_items):
-        if len(hits) >= top_n * 3:  # 多留一些供后续排序截断
+
+    for batch_start in range(0, _MAX_SCAN, _BATCH_SIZE):
+        if len(hits) >= top_n * 3:
             break
-        symbol = item["code"]
-        try:
-            bars = await fetch_history_bars_for_screener(symbol, days=need_days)
-        except Exception:
-            continue
-        if not bars or len(bars) < need_days:
-            continue
+        batch = bs_groups[batch_start : batch_start + _BATCH_SIZE]
+        batch_codes = [bc for bc, _ in batch]
+
+        # 跳过已缓存的
+        uncached_codes = []
+        cached_bars: dict[str, list] = {}
+        for bc, _ in batch:
+            cb = _cache_get(f"screener_hist:{bc}:{need_days}")
+            if cb is not None:
+                cached_bars[bc] = cb
+            else:
+                uncached_codes.append(bc)
+
+        # 批量拉 uncached
+        if uncached_codes:
+            batch_result = await _bs_query_batch(uncached_codes, need_days)
+            for bc, bars in batch_result.items():
+                _cache_set(f"screener_hist:{bc}:{need_days}", bars)
+            cached_bars.update(batch_result)
+            # baostock 限流保护
+            await asyncio.sleep(0.1)
 
         import pandas as pd
-        df = pd.DataFrame(bars)
-        df = df.sort_values("date").reset_index(drop=True)
-        try:
-            triggered = check_fn(df)
-        except Exception:
-            triggered = False
-
-        if triggered:
-            hits.append({
-                **item,
-                "signal": signal,
-                "signal_name": name,
-            })
-            logger.debug(f"[screener] {symbol} {item['name']} → {signal}")
-
-        # 限速：每 10 只睡 0.2s，避免把 baostock 限流打满
-        if (i + 1) % 10 == 0:
-            await asyncio.sleep(0.2)
+        for bc, item in batch:
+            if len(hits) >= top_n * 3:
+                break
+            bars = cached_bars.get(bc)
+            if not bars or len(bars) < need_days:
+                continue
+            try:
+                df = pd.DataFrame(bars).sort_values("date").reset_index(drop=True)
+                if check_fn(df):
+                    hits.append({**item, "signal": signal, "signal_name": name})
+            except Exception:
+                continue
 
     # 按当日涨幅排序取 top_n
     hits.sort(key=lambda x: x.get("change_pct", 0), reverse=True)
@@ -492,8 +510,7 @@ async def screener_signals():
 
 
 async def fetch_history_bars_for_screener(symbol: str, days: int = 20) -> List[Dict[str, Any]]:
-    """screener 专用的极简 K 线拉取——只取 baostock/新浪 日线，不复用复杂的 agent 层函数。"""
-    # 优先从 market history 缓存里取（用户可能刚查过）
+    """单只 K 线拉取（走缓存；baostock 不可用时新浪兜底）。"""
     cached = _cache_get(f"screener_hist:{symbol}:{days}")
     if cached is not None:
         return cached
@@ -505,29 +522,98 @@ async def fetch_history_bars_for_screener(symbol: str, days: int = 20) -> List[D
     if not bs_code:
         return []
 
-    bars: List[Dict[str, Any]] = []
+    bars = await _bs_query_one(bs_code, days)
+    if not bars:
+        # 新浪兜底
+        try:
+            sina = await asyncio.wait_for(_sina_kline(symbol, days + 30), timeout=10)
+            if sina and sina.get("data"):
+                bars = sina["data"]
+        except Exception:
+            pass
 
-    # 1) baostock 主源
+    if bars:
+        _cache_set(f"screener_hist:{symbol}:{days}", bars)
+    return bars
+
+
+async def _bs_query_one(bs_code: str, days: int) -> list:
+    """单只 baostock 查询（内部：login → query → logout）。"""
+    from datetime import datetime, timedelta
     try:
         import baostock as bs
-        start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
-        end = datetime.now().strftime("%Y-%m-%d")
-        loop = asyncio.get_event_loop()
+    except ImportError:
+        return []
 
-        def _do_query():
+    start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
+    end = datetime.now().strftime("%Y-%m-%d")
+    loop = asyncio.get_event_loop()
+
+    def _sync():
+        try:
+            lg = bs.login()
+            if lg.error_code != "0":
+                return []
             try:
-                lg = bs.login()
-                if lg.error_code != "0":
-                    return None
+                rs = bs.query_history_k_data_plus(
+                    bs_code, "date,open,high,low,close,volume",
+                    start_date=start, end_date=end, frequency="d", adjustflag="3",
+                )
+                if rs.error_code != "0":
+                    return []
+                rows = []
+                while rs.next():
+                    r = rs.get_row_data()
+                    try:
+                        rows.append({
+                            "date": r[0], "open": float(r[1]), "high": float(r[2]),
+                            "low": float(r[3]), "close": float(r[4]),
+                            "volume": float(r[5]) if r[5] else 0.0,
+                        })
+                    except (ValueError, IndexError):
+                        continue
+                return rows
+            finally:
+                bs.logout()
+        except Exception:
+            return []
+
+    try:
+        result = await asyncio.wait_for(loop.run_in_executor(None, _sync), timeout=10)
+        return result or []
+    except asyncio.TimeoutError:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+        return []
+
+
+async def _bs_query_batch(bs_codes: list[str], days: int) -> dict[str, list]:
+    """批量查询（一次 login → N 次 query → 一次 logout），比单只快 10x+。"""
+    from datetime import datetime, timedelta
+    try:
+        import baostock as bs
+    except ImportError:
+        return {}
+
+    start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
+    end = datetime.now().strftime("%Y-%m-%d")
+
+    def _sync_all():
+        result: dict[str, list] = {}
+        try:
+            lg = bs.login()
+            if lg.error_code != "0":
+                return result
+            for bc in bs_codes:
                 try:
                     rs = bs.query_history_k_data_plus(
-                        bs_code,
-                        "date,open,high,low,close,volume",
-                        start_date=start, end_date=end,
-                        frequency="d", adjustflag="3",
+                        bc, "date,open,high,low,close,volume",
+                        start_date=start, end_date=end, frequency="d", adjustflag="3",
                     )
                     if rs.error_code != "0":
-                        return None
+                        continue
                     rows = []
                     while rs.next():
                         r = rs.get_row_data()
@@ -539,30 +625,27 @@ async def fetch_history_bars_for_screener(symbol: str, days: int = 20) -> List[D
                             })
                         except (ValueError, IndexError):
                             continue
-                    return rows
-                finally:
-                    bs.logout()
+                    if rows:
+                        result[bc] = rows
+                except Exception:
+                    continue
+            bs.logout()
+        except Exception:
+            try:
+                bs.logout()
             except Exception:
-                return None
+                pass
+        return result
 
-        result = await asyncio.wait_for(loop.run_in_executor(None, _do_query), timeout=10)
-        if result:
-            bars = result
-    except Exception:
-        pass
-
-    # 2) 新浪兜底
-    if not bars:
+    loop = asyncio.get_event_loop()
+    try:
+        return await asyncio.wait_for(loop.run_in_executor(_executor, _sync_all), timeout=120)
+    except asyncio.TimeoutError:
         try:
-            sina = await asyncio.wait_for(_sina_kline(symbol, days + 30), timeout=10)
-            if sina and sina.get("data"):
-                bars = sina["data"]
+            bs.logout()
         except Exception:
             pass
-
-    if bars:
-        _cache_set(f"screener_hist:{symbol}:{days}", bars)
-    return bars
+        return {}
 
 
 # ===================== 启动预热 =====================
