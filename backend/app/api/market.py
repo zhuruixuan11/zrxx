@@ -432,6 +432,7 @@ async def screener_strategic(
     full_items = await _cached_fetch("screener_full", _fetch_screener_sync)
 
     # 批量查 K 线：分块 + baostock 一次 login 多只 query（比单只快 10x+）
+    from datetime import datetime, timedelta
     from ..agent.tools import normalize_a_share
     bs_groups: list[tuple[str, dict]] = []  # (bs_code, item_dict)
     for item in full_items:
@@ -445,16 +446,28 @@ async def screener_strategic(
     scanned = 0
     degraded = False
 
+    # 本地日线缓存新鲜时直接读 SQLite，跳过逐只 baostock 查询（167s → 秒级）
+    from ..services import daily_cache
+    local_bars: dict[str, list] = {}
+    if await daily_cache.is_fresh():
+        min_date = (datetime.now() - timedelta(days=need_days * 3 + 20)).strftime("%Y-%m-%d")
+        local_bars = await daily_cache.get_cached_bars(
+            [bc for bc, _ in bs_groups[:_MAX_SCAN]], need_days, min_date,
+        )
+        logger.info(f"[screener] 本地日线缓存命中 {len(local_bars)}/{_MAX_SCAN}")
+
     for batch_start in range(0, _MAX_SCAN, _BATCH_SIZE):
         if len(hits) >= top_n * 3:
             break
         batch = bs_groups[batch_start : batch_start + _BATCH_SIZE]
 
-        # 跳过已缓存的
+        # 跳过已缓存的（内存 5min 缓存 或 本地日线库）
         uncached_codes = []
         cached_bars: dict[str, list] = {}
         for bc, _ in batch:
             cb = _cache_get(f"screener_hist:{bc}:{need_days}")
+            if cb is None:
+                cb = local_bars.get(bc)
             if cb is not None:
                 cached_bars[bc] = cb
             else:
@@ -501,6 +514,7 @@ async def screener_strategic(
             "signal_desc": desc,
             "total_scanned": scanned,
             "degraded": degraded,
+            "data_source": "local_cache" if local_bars else "baostock_live",
             "results": hits,
         },
     }
@@ -514,6 +528,21 @@ async def screener_signals():
     for sid, (name, desc, need_days, _) in _STRATEGY_SIGNALS.items():
         items.append({"id": sid, "name": name, "desc": desc, "need_days": need_days})
     return {"code": 0, "msg": "ok", "data": {"signals": items}}
+
+
+@router.get("/screener/cache-status")
+async def screener_cache_status():
+    """本地日线缓存状态（新鲜度/覆盖量/数据日期）。"""
+    from ..services import daily_cache
+    return {"code": 0, "msg": "ok", "data": await daily_cache.cache_status()}
+
+
+@router.post("/screener/cache-refresh")
+async def screener_cache_refresh():
+    """手动触发全市场日线缓存刷新（每日 16:35 定时刷新之外的补充入口）。"""
+    from ..services import daily_cache
+    result = await daily_cache.refresh_daily_cache()
+    return {"code": 0, "msg": "ok", "data": result}
 
 
 async def fetch_history_bars_for_screener(symbol: str, days: int = 20) -> List[Dict[str, Any]]:

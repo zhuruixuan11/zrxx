@@ -23,6 +23,7 @@ from .api.portfolio import router as portfolio_router
 from .api.profile import router as profile_router
 from .api.signals import router as signals_router
 from .services.alerts import start_monitor, stop_monitor
+from .services.daily_cache import start_daily_cache_scheduler, stop_daily_cache_scheduler
 
 settings = get_settings()
 limiter = Limiter(key_func=get_ipaddr)
@@ -55,6 +56,7 @@ async def lifespan(app: fastapi.FastAPI):
             )
     await init_tables()
     start_monitor()
+    start_daily_cache_scheduler()
     warmup_task = asyncio.create_task(prewarm_caches())
     logger.info("衡策 启动完成 ✅")
     try:
@@ -62,6 +64,7 @@ async def lifespan(app: fastapi.FastAPI):
     finally:
         warmup_task.cancel()
         stop_monitor()
+        stop_daily_cache_scheduler()
 
 
 app = fastapi.FastAPI(

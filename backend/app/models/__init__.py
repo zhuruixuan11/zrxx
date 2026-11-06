@@ -5,3 +5,4 @@ from .chat import ChatHistory  # noqa: F401
 from .dataset import Dataset, DatasetSample  # noqa: F401
 from .alert import PriceAlert  # noqa: F401
 from .backtest_run import BacktestRun  # noqa: F401
+from .daily_bar import DailyBar, DailyCacheMeta  # noqa: F401

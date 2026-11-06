@@ -56,6 +56,7 @@ async def init_tables():
     from .models.dataset import Dataset, DatasetSample  # noqa: F401
     from .models.alert import PriceAlert  # noqa: F401
     from .models.backtest_run import BacktestRun  # noqa: F401
+    from .models.daily_bar import DailyBar, DailyCacheMeta  # noqa: F401
 
     # 1) SQLite 字段迁移 — 老库补新列（绕过 aiosqlite 直接 sync 操作）
     try:
@@ -75,6 +76,7 @@ async def init_tables():
             ("price_alerts", "alert_type", "VARCHAR(10) DEFAULT 'price'"),
             ("price_alerts", "reference_price", "FLOAT"),
             ("price_alerts", "change_pct", "FLOAT"),
+            ("chat_histories", "payload", "TEXT"),
         ]
 
         def _do_migrate():
