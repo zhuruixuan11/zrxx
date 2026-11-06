@@ -148,7 +148,21 @@ async def refresh_daily_cache() -> Dict[str, Any]:
         today = date.today()
         start = (today - timedelta(days=_WINDOW_DAYS)).isoformat()
         end = today.isoformat()
-        logger.info(f"[daily-cache] 共 {len(codes)} 只待刷新（{start} ~ {end}）")
+
+        # 断点续传：已有足够近期数据的股票直接跳过。
+        # 首次全量约 1 小时，中途若 baostock 抖动中断，重跑只需补剩下的部分。
+        skip_after = (_expected_bar_date(datetime.now()) - timedelta(days=5)).isoformat()
+        async with async_session() as db:
+            rows = (await db.execute(text(
+                "SELECT symbol, MAX(date) AS d, COUNT(*) AS n FROM daily_bar_cache "
+                "WHERE date >= :start GROUP BY symbol"
+            ), {"start": start})).all()
+        ready = {sym for sym, d, n in rows if d and d >= skip_after and n >= 21}
+        pending = [c for c in codes if c not in ready]
+        logger.info(
+            f"[daily-cache] 共 {len(codes)} 只，已完成 {len(ready)} 只，"
+            f"待刷新 {len(pending)} 只（{start} ~ {end}）"
+        )
 
         upsert_sql = text(
             "INSERT OR REPLACE INTO daily_bar_cache "
@@ -159,15 +173,27 @@ async def refresh_daily_cache() -> Dict[str, Any]:
         total_rows = 0
         done = 0
         aborted = False
-        for i in range(0, len(codes), _CHUNK_SIZE):
-            chunk = codes[i : i + _CHUNK_SIZE]
-            result = await baostock_gateway.fetch_bars_many(
-                chunk, start, end, frequency="d", adjustflag="3", timeout=180,
-            )
+        for i in range(0, len(pending), _CHUNK_SIZE):
+            chunk = pending[i : i + _CHUNK_SIZE]
+            result = None
+            # baostock 偶发不可用时给两次补救机会（等熔断冷却结束再试），
+            # 全部失败才判定本轮中止，避免一次抖动就前功尽弃
+            for attempt in range(3):
+                result = await baostock_gateway.fetch_bars_many(
+                    chunk, start, end, frequency="d", adjustflag="3", timeout=180,
+                )
+                if result is not None:
+                    break
+                if attempt < 2:
+                    logger.warning(
+                        f"[daily-cache] 第 {attempt + 1} 次拉取失败，60s 后重试 "
+                        f"（已 {done}/{len(pending)}）"
+                    )
+                    await asyncio.sleep(60)
             if result is None:
                 # 网关熔断/不可用：保留已写入部分，不更新 meta（下次仍判 stale）
                 logger.warning(
-                    f"[daily-cache] baostock 不可用，刷新中止于 {done}/{len(codes)}"
+                    f"[daily-cache] baostock 持续不可用，本轮中止于 {done}/{len(pending)}"
                 )
                 aborted = True
                 break
@@ -186,8 +212,8 @@ async def refresh_daily_cache() -> Dict[str, Any]:
                     await db.commit()
                 total_rows += len(params)
             done += len(chunk)
-            if done % 1000 == 0:
-                logger.info(f"[daily-cache] 进度 {done}/{len(codes)}，已写入 {total_rows} 行")
+            if done % 500 == 0:
+                logger.info(f"[daily-cache] 进度 {done}/{len(pending)}，已写入 {total_rows} 行")
 
         async with async_session() as db:
             # 清掉窗口外的老数据
@@ -207,10 +233,11 @@ async def refresh_daily_cache() -> Dict[str, Any]:
         elapsed = (datetime.now() - started).total_seconds()
         logger.info(
             f"[daily-cache] 刷新{'中止' if aborted else '完成'}："
-            f"{done}/{len(codes)} 只，{total_rows} 行，耗时 {elapsed:.0f}s"
+            f"本轮 {done}/{len(pending)} 只（总计 {len(ready) + done}/{len(codes)}），"
+            f"{total_rows} 行，耗时 {elapsed:.0f}s"
         )
-        return {"ok": not aborted, "scanned": done, "rows": total_rows,
-                "elapsed_s": round(elapsed, 1)}
+        return {"ok": not aborted, "scanned": done, "pending": len(pending),
+                "rows": total_rows, "elapsed_s": round(elapsed, 1)}
 
 
 # ---------------- 调度 ----------------
@@ -226,11 +253,18 @@ def _next_refresh_dt(now: datetime) -> datetime:
 
 
 async def _loop():
-    # 启动时若缓存不新鲜（首次部署/停机错过收盘），立即补一轮
+    # 启动时若缓存不新鲜（首次部署/停机错过收盘），立即补一轮；
+    # 本轮未跑完（baostock 抖动中止）则隔 20 分钟续传，而不是干等到明天 16:35
     try:
         if not await is_fresh():
             logger.info("[daily-cache] 缓存为空或已过期，启动即触发刷新")
-            await refresh_daily_cache()
+            result = await refresh_daily_cache()
+            attempts = 0
+            while not result.get("ok") and attempts < 6:
+                attempts += 1
+                logger.info(f"[daily-cache] 未完成，20 分钟后续传（第 {attempts} 次）")
+                await asyncio.sleep(1200)
+                result = await refresh_daily_cache()
         else:
             logger.info("[daily-cache] 缓存新鲜，等待每日 16:35 定时刷新")
     except asyncio.CancelledError:
