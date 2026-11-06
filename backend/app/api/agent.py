@@ -88,7 +88,9 @@ async def chat(req: ChatRequest, request: Request, user: User = Depends(get_curr
         "confidence": result.get("intent_confidence"),
         "needs_clarification": result.get("needs_clarification", False),
         "sources": result.get("rag_sources", []),
-        "backtest_results": result.get("backtest_results", []),  # ✨ 前端卡片展示
+        "backtest_results": result.get("backtest_results", []),  # 按 symbol 分组的 [{symbol, symbol_name, results: [...]}]
+        "symbols": result.get("symbols", []),
+        "symbol_names": result.get("symbol_names", []),
     }
     # 只缓存成功回答；超时兜底是暂态，不缓存
     if result.get("response_type") != "timeout":

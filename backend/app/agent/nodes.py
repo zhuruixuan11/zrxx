@@ -153,15 +153,14 @@ async def node_market(state: AgentState) -> Dict[str, Any]:
             "response": "\n".join(lines), "response_type": "text"}
 
 
-# ========== 节点 2c：投资分析（并行 fan-out → 汇总给 LLM → 可选回测验证）========
+# ========== 节点 2c：投资分析（单/多标的自适应并行 → LLM 对比）========
 async def node_analysis(state: AgentState) -> Dict[str, Any]:
-    """并行跑 portfolio + market + rag + news + **自动回测验证**，让 LLM 基于实锤数据给建议。"""
+    """并行跑 portfolio + 宏观 + 资金面 + **每只 symbol 的行情/指标/回测**，LLM 基于真实数据给对比建议。"""
     message = state.get("message", "")
     user_id = state.get("user_id", "")
-    symbols = _extract_symbols(message)
+    symbols = _extract_symbols(message)[:5]  # 最多 5 只，防止并发过多限流
 
-    # 4 路并发：组合 + 行情 + RAG 知识 + 实时财经快讯（画像也顺带取）
-    # 每路加独立超时：任一数据源卡住都只降级该路，不拖垮整次回答
+    # 基础数据源（不依赖 symbol）
     async def _safe(coro, timeout: float, default):
         try:
             return await asyncio.wait_for(coro, timeout=timeout)
@@ -169,36 +168,65 @@ async def node_analysis(state: AgentState) -> Dict[str, Any]:
             logger.warning(f"[analysis] 数据源超时或失败，已降级：{e}")
             return default
 
+    # 全局：组合 + 画像 + RAG + 新闻 + 宏观 + 资金面
     async with asyncio.TaskGroup() as tg:
         t_portfolio = tg.create_task(
             _safe(_fetch_portfolio(user_id), 12, {"total_value": 0.0, "pnl_percent": 0.0})
         )
         t_profile = tg.create_task(_safe(get_profile_summary(user_id), 5, ""))
-        t_market = tg.create_task(_safe(get_quote(symbols[0]), 8, None)) if symbols else None
         t_rag = tg.create_task(_safe(retrieve(message), 6, {}))
         t_news = tg.create_task(_safe(fetch_news(limit=10), 6, []))
-        t_ind = (
-            tg.create_task(_safe(_fetch_indicators(symbols[0]), 8, {}))
-            if symbols else None
-        )
         t_macro = tg.create_task(_safe(get_macro_overview(), 12, {}))
         t_funds = tg.create_task(_safe(get_fund_flow_overview(), 12, {}))
 
-        # ✨ 新增：自动回测验证 —— 对当前股票跑 2-3 个代表性策略
-        t_bt = (
-            tg.create_task(_safe(_run_quick_backtests(symbols[0]), 30, []))
-            if symbols else None
-        )
+        # ✨ 每只 symbol 一路并行（行情 + 指标 + 3 策略回测）
+        async def _analyze_one(sym: str) -> dict:
+            async def _inner() -> dict:
+                async with asyncio.TaskGroup() as subtg:
+                    t_q = subtg.create_task(_safe(get_quote(sym), 8, None))
+                    t_i = subtg.create_task(_safe(_fetch_indicators(sym), 8, {}))
+                    t_bt = subtg.create_task(_safe(_run_quick_backtests(sym), 30, []))
+                quote = t_q.result()
+                indicators = t_i.result()
+                backtests = t_bt.result()
+
+                # 从 quote 里拿中文名（回测结果里要带）
+                sym_name = ""
+                if quote and "error" not in quote:
+                    sym_name = quote.get("name") or quote.get("symbol") or sym
+
+                return {
+                    "symbol": sym,
+                    "symbol_name": sym_name,
+                    "quote": quote,
+                    "indicators": indicators,
+                    "backtests": backtests,
+                }
+            try:
+                return await asyncio.wait_for(_inner(), timeout=45)
+            except Exception as e:
+                logger.warning(f"[analysis] {sym} 分析失败降级：{e}")
+                return {"symbol": sym, "symbol_name": sym, "quote": None, "indicators": {}, "backtests": []}
+
+        symbol_tasks = [tg.create_task(_analyze_one(s)) for s in symbols]
 
     portfolio = t_portfolio.result()
     profile_summary = t_profile.result()
-    quote = t_market.result() if t_market else None
     rag = t_rag.result()
     news_items = t_news.result()
-    indicators = t_ind.result() if t_ind else {}
     macro = t_macro.result()
     funds = t_funds.result()
-    backtest_results = t_bt.result() if t_bt else []
+    symbol_results = [t.result() for t in symbol_tasks]
+
+    # 提取聚合结构给前端：按 symbol 分组的 backtest_results
+    all_backtests = []
+    for sr in symbol_results:
+        if sr["backtests"]:
+            all_backtests.append({
+                "symbol": sr["symbol"],
+                "symbol_name": sr["symbol_name"],
+                "results": sr["backtests"],
+            })
 
     # 构建 LLM 上下文
     context_parts = [f"用户问题：{message}"]
@@ -208,137 +236,131 @@ async def node_analysis(state: AgentState) -> Dict[str, Any]:
         f"投资组合概览：总资产 ¥{portfolio['total_value']:,.2f}，"
         f"累计盈亏 {portfolio['pnl_percent']:+.2f}%"
     )
-    if quote and "error" not in quote:
-        context_parts.append(
-            f"行情数据 {quote['symbol']}：现价 ¥{quote['current_price']}"
-            f"（{quote['change_percent']:+.2f}%），"
-            f"交易日 {quote.get('trade_date', '未知')}，"
-            f"数据源 {quote.get('data_source', 'unknown')}"
-        )
-        val = []
-        if quote.get("pe") is not None:
-            val.append(f"PE(动) {quote['pe']}")
-        if quote.get("pb") is not None:
-            val.append(f"PB {quote['pb']}")
-        if quote.get("total_mv") is not None:
-            val.append(f"总市值 {quote['total_mv']} 亿")
-        if quote.get("turnover_rate") is not None:
-            val.append(f"换手率 {quote['turnover_rate']}%")
-        if quote.get("volume_ratio") is not None:
-            val.append(f"量比 {quote['volume_ratio']}")
-        if val:
-            context_parts.append("估值与量能：" + "，".join(val))
-    if indicators:
-        parts = []
-        for label, key in (("MA5", "ma5"), ("MA10", "ma10"), ("MA20", "ma20"), ("MA60", "ma60")):
-            if indicators.get(key) is not None:
-                parts.append(f"{label} ¥{indicators[key]}")
-        if indicators.get("rsi14") is not None:
-            parts.append(f"RSI14 {indicators['rsi14']}")
-        if indicators.get("ret5") is not None:
-            parts.append(f"近5日 {indicators['ret5']:+.2f}%")
-        if indicators.get("ret20") is not None:
-            parts.append(f"近20日 {indicators['ret20']:+.2f}%")
-        if indicators.get("pos60") is not None:
-            parts.append(f"60日区间位置 {indicators['pos60']}%")
-        if indicators.get("volatility20") is not None:
-            parts.append(f"20日年化波动率 {indicators['volatility20']}%")
-        if indicators.get("vol_ratio_5_20") is not None:
-            parts.append(f"5/20日量比 {indicators['vol_ratio_5_20']}")
-        if parts:
-            context_parts.append(
-                f"技术指标（{indicators.get('bars', 0)} 根日线，前复权）：" + "，".join(parts)
-            )
 
-    # 宏观经济读数（6 小时缓存，数据缺失时跳过、不留空字段）
+    # ✨ 每只 symbol 独立的行情+指标+回测区块
+    if symbol_results:
+        context_parts.append(f"--- 股票分析（共 {len(symbol_results)} 只） ---")
+        for sr in symbol_results:
+            sym = sr["symbol"]
+            sname = sr.get("symbol_name", sym)
+            context_parts.append(f"\n### {sname}（{sym}）")
+
+            # 行情
+            quote = sr["quote"]
+            if quote and "error" not in quote:
+                qlines = [f"现价 ¥{quote['current_price']}（{quote['change_percent']:+.2f}%）"]
+                val = []
+                if quote.get("pe") is not None: val.append(f"PE {quote['pe']}")
+                if quote.get("pb") is not None: val.append(f"PB {quote['pb']}")
+                if quote.get("total_mv") is not None: val.append(f"市值 {quote['total_mv']}亿")
+                if quote.get("turnover_rate") is not None: val.append(f"换手 {quote['turnover_rate']}%")
+                if quote.get("volume_ratio") is not None: val.append(f"量比 {quote['volume_ratio']}")
+                if val: qlines.append("估值/量能：" + "，".join(val))
+                context_parts.append("  行情：" + " | ".join(qlines))
+            elif quote and quote.get("error"):
+                context_parts.append(f"  行情：查不到（{quote.get('error')}）")
+
+            # 技术指标
+            ind = sr["indicators"]
+            if ind:
+                plist = []
+                for label, key in (("MA5", "ma5"), ("MA10", "ma10"), ("MA20", "ma20"), ("MA60", "ma60")):
+                    if ind.get(key) is not None: plist.append(f"{label}¥{ind[key]}")
+                if ind.get("rsi14") is not None: plist.append(f"RSI14={ind['rsi14']}")
+                if ind.get("ret5") is not None: plist.append(f"5日{ind['ret5']:+.2f}%")
+                if ind.get("ret20") is not None: plist.append(f"20日{ind['ret20']:+.2f}%")
+                if ind.get("pos60") is not None: plist.append(f"60日位{ind['pos60']}%")
+                if plist: context_parts.append("  指标：" + "，".join(plist))
+
+            # 回测
+            bts = sr["backtests"]
+            if bts:
+                for bt in bts:
+                    m = bt["metrics"]
+                    context_parts.append(
+                        f"  回测/{bt['strategy_name']}："
+                        f"收益{m['total_return_pct']:+.2f}% 年化{m['annual_return_pct']:+.2f}% "
+                        f"Sharpe{m['sharpe_ratio']:.2f} 回撤{m['max_drawdown_pct']:.2f}% "
+                        f"胜率{m['win_rate_pct']:.0f}% {m['trades_count']}笔"
+                    )
+            else:
+                context_parts.append("  回测：数据不足或超时跳过")
+
+    # 宏观经济
     if macro:
         m = []
         if macro.get("gdp", {}).get("yoy") is not None:
-            m.append(f"GDP 同比 {macro['gdp']['yoy']}%（{macro['gdp'].get('period', '')}）")
+            m.append(f"GDP 同比 {macro['gdp']['yoy']}%")
         if macro.get("cpi", {}).get("yoy") is not None:
-            m.append(f"CPI 同比 {macro['cpi']['yoy']}%（{macro['cpi'].get('period', '')}）")
+            m.append(f"CPI 同比 {macro['cpi']['yoy']}%")
         if macro.get("m2", {}).get("yoy") is not None:
             m.append(f"M2 同比 {macro['m2']['yoy']}%")
         if macro.get("shibor", {}).get("rate_1w") is not None:
             m.append(f"SHIBOR 1周 {macro['shibor']['rate_1w']}%")
-        if m:
-            context_parts.append("宏观环境：" + "，".join(m))
+        if m: context_parts.append("宏观环境：" + "，".join(m))
 
-    # 市场资金面（30 分钟缓存）
+    # 资金面
     if funds:
         f = []
         mf = funds.get("market_main_flow")
         if mf and mf.get("net_inflow_yi") is not None:
-            pct = f"（占成交 {mf['net_pct']}%）" if mf.get("net_pct") is not None else ""
-            f.append(f"大盘主力净流入 {mf['net_inflow_yi']:+} 亿{pct}（{mf.get('date', '')}）")
+            f.append(f"大盘主力净流入 {mf['net_inflow_yi']:+} 亿（{mf.get('date', '')}）")
         lhb = funds.get("lhb_top") or []
         if lhb:
-            tops = "、".join(
-                f"{x['name']}({x['code']}) 净买 {x['net_buy_yi']} 亿" for x in lhb[:3]
-            )
-            f.append(f"最新龙虎榜净买居前：{tops}（{lhb[0].get('date', '')}）")
-        if f:
-            context_parts.append("市场资金面：" + "；".join(f))
+            tops = "、".join(f"{x['name']} 净买 {x['net_buy_yi']} 亿" for x in lhb[:3])
+            f.append(f"龙虎榜净买居前：{tops}")
+        if f: context_parts.append("市场资金面：" + "；".join(f))
 
     if rag.get("context"):
         context_parts.append(f"参考知识：\n{rag['context']}")
 
-    # 注入真实新闻（重要！让 AI 基于最新资讯给建议）
     news_text = format_news_for_prompt(news_items, max_items=8)
     context_parts.append(news_text)
 
-    # ✨ 新增：回测验证结果 —— 这是最硬的数据支撑
-    if backtest_results:
-        bt_lines = ["自动回测验证（过去 120 个交易日，初始资金 ¥200,000）："]
-        for bt in backtest_results:
-            m = bt["metrics"]
-            bt_lines.append(
-                f"  · {bt['strategy_name']}（{bt['strategy_id']}）："
-                f"总收益 {m['total_return_pct']:+.2f}%，年化 {m['annual_return_pct']:+.2f}%，"
-                f"Sharpe {m['sharpe_ratio']:.2f}，最大回撤 {m['max_drawdown_pct']:.2f}%，"
-                f"胜率 {m['win_rate_pct']:.0f}%，交易 {m['trades_count']} 笔"
-            )
-        context_parts.append("\n".join(bt_lines))
-
-    # 调用 LLM 生成分析
+    # LLM prompt
     llm = get_llm()
     disclaimer = state.get("disclaimer", "")
+    is_multi = len(symbol_results) > 1
     prompt = (
-        f"你是一名严谨的 A 股投资顾问。下面 <data> 标签内的内容由系统实时获取，"
-        f"是本次分析唯一可引用的数据来源。\n\n"
+        f"你是一名严谨的 A 股投资顾问。下面 <data> 标签内的内容由系统实时获取。\n\n"
         f"<data>\n{'\n'.join(context_parts)}\n</data>\n\n"
-        f"硬性规则（违反任何一条都视为不合格回答）：\n"
-        f"1. 只能引用 <data> 中出现的数字、事实和新闻；严禁编造财务指标、目标价、机构预测、行业景气度数据\n"
-        f"2. <data> 中没有提供的数据，直接写「数据不足」，不得用常识推测补齐\n"
-        f"3. 结论必须至少引用 2 个 <data> 中的具体数据点（如 MA20、RSI14、近20日涨跌幅、PE、回测收益、组合仓位）\n"
-        f"4. 严格区分「数据显示」与「经验判断」，后者必须标注为推测\n"
-        f"5. 不承诺收益、不给精确目标价，必须指出主要风险和不确定性\n"
-        f"6. 如果 <data> 中有「自动回测验证」结果：**这是核心依据，必须优先引用**，"
-        f"直接基于回测 Sharpe/收益/回撤数据判断哪类策略在这只股票上最有效，"
-        f"不要再建议「可以用 X 策略回测」——系统已经替你跑过了\n"
-        f"7. 如果 <data> 中没有回测数据（该股票可能数据太少或数据源离线），"
-        f"可以建议 2-3 种可选策略（保守/稳健/积极），并给出可供回测验证的具体参数"
-        f"（策略类型如双均线/RSI/动量、关键参数、回测区间）\n"
-        f"8. 全文控制在 500 字以内，先给结论，再给数据依据，最后附免责声明\n"
+        f"硬性规则：\n"
+        f"1. 只能引用 <data> 中出现的数字；数据不足直接写「数据不足」\n"
+        f"2. 必须至少引用 2 个具体数据点（回测 Sharpe/收益、PE、MA、RSI 等）\n"
+        f"3. 不承诺收益、不给精确目标价，必须指出主要风险\n"
+        f"4. 回测数据是核心依据——直接基于 Sharpe/收益/回撤下判断，不要再说「可以试试 X 策略」\n"
+        f"5. 全文 500 字以内，先结论，再数据依据，最后免责声明\n"
     )
+    if is_multi:
+        prompt += (
+            f"6. **多标的对比模式**：必须横向对比每只股票的回测 Sharpe、收益、回撤，"
+            f"明确回答「哪只最值得关注」「哪只风险最高」，给出排序\n"
+            f"7. 每只股票的优劣各说一句，最后给出一个推荐优先级\n"
+        )
+
     reply = await llm.achat(
         [{"role": "user", "content": prompt}],
         system_prompt=(
             "你是严谨的 A 股投资顾问。所有数字必须来自用户提供的 <data> 区块，"
-            "数据缺失就明确说「数据不足」，绝不编造，绝不承诺收益。"
+            "绝不编造，绝不承诺收益。"
         ),
     )
     if disclaimer and disclaimer not in reply:
         reply += f"\n\n---\n⚠️ {disclaimer}"
 
+    # 聚合单标的 market_data（兼容旧前端）
+    first_quote = symbol_results[0]["quote"] if symbol_results else None
+
     return {
         "portfolio_data": portfolio,
-        "market_data": {"quote": quote} if quote else None,
+        "market_data": {"quote": first_quote} if first_quote and "error" not in first_quote else None,
+        "symbols": [sr["symbol"] for sr in symbol_results],
+        "symbol_names": [sr.get("symbol_name", sr["symbol"]) for sr in symbol_results],
+        "backtest_results": all_backtests,  # 按 symbol 分组
         "rag_sources": rag.get("sources", []),
         "rag_context": rag.get("context", ""),
         "news_count": len(news_items),
         "news_sources": list({n.get("source", "") for n in news_items}),
-        "backtest_results": backtest_results,  # ✨ 前端展示用
         "response": reply,
         "response_type": "markdown",
     }
