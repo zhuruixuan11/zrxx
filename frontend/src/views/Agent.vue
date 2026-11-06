@@ -27,6 +27,50 @@
               <span class="typing-text">衡策智算正在思考…</span>
             </div>
             <div v-else class="msg-content" v-html="formatMsg(msg.content)" />
+
+            <!-- ✨ 回测结果对比卡片 -->
+            <div
+              v-if="msg.backtest_results?.length"
+              class="bt-card"
+            >
+              <div class="bt-header">
+                <el-icon><DataAnalysis /></el-icon>
+                <span>自动回测验证（120 交易日 · 20 万）</span>
+              </div>
+              <div class="bt-table">
+                <div class="bt-row bt-head">
+                  <span>策略</span><span class="r">总收益</span>
+                  <span class="r">年化</span><span class="r">Sharpe</span>
+                  <span class="r">回撤</span><span class="r">交易</span>
+                </div>
+                <div
+                  v-for="bt in msg.backtest_results"
+                  :key="bt.strategy_id"
+                  class="bt-row"
+                  :class="{ best: isBest(bt, msg.backtest_results!) }"
+                >
+                  <span class="bt-name">{{ bt.strategy_name }}</span>
+                  <span class="r" :class="bt.metrics.total_return_pct >= 0 ? 'pos' : 'neg'">
+                    {{ bt.metrics.total_return_pct >= 0 ? '+' : '' }}{{ bt.metrics.total_return_pct.toFixed(2) }}%
+                  </span>
+                  <span class="r">{{ bt.metrics.annual_return_pct.toFixed(2) }}%</span>
+                  <span class="r">{{ bt.metrics.sharpe_ratio.toFixed(2) }}</span>
+                  <span class="r neg">{{ bt.metrics.max_drawdown_pct.toFixed(2) }}%</span>
+                  <span class="r">{{ bt.metrics.trades_count }}</span>
+                </div>
+              </div>
+              <div class="bt-actions">
+                <el-button
+                  link
+                  type="primary"
+                  size="small"
+                  @click="msg.symbol && goBacktest(msg.symbol)"
+                >
+                  完整回测详情 →
+                </el-button>
+              </div>
+            </div>
+
             <div
               v-if="msg.role === 'assistant' && !msg.pending && msg.intent === 'investment_analysis' && msg.symbol"
               class="msg-actions"
@@ -69,7 +113,7 @@
 <script setup lang="ts">
 import { ref, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
-import { Promotion } from '@element-plus/icons-vue'
+import { Promotion, DataAnalysis } from '@element-plus/icons-vue'
 import { agentApi } from '@/api/agent'
 
 const router = useRouter()
@@ -80,6 +124,19 @@ interface ChatMsg {
   intent?: string
   /** 分析类回答对应的股票代码，用于跳转回测 */
   symbol?: string
+  /** Agent 自动跑的回测结果，用于渲染对比卡片 */
+  backtest_results?: Array<{
+    strategy_id: string
+    strategy_name: string
+    metrics: {
+      total_return_pct: number
+      annual_return_pct: number
+      sharpe_ratio: number
+      max_drawdown_pct: number
+      win_rate_pct: number
+      trades_count: number
+    }
+  }>
   /** 等待回复时的占位气泡 */
   pending?: boolean
 }
@@ -178,7 +235,8 @@ async function send(text: string) {
       role: 'assistant',
       content: resp.response,
       intent: resp.intent,
-      symbol: resp.intent === 'investment_analysis' ? symbol : undefined,
+      symbol: symbol || undefined,
+      backtest_results: (resp as any).backtest_results || [],
     }
   } catch (e) {
     const err = e as { code?: string; message?: string }
@@ -201,6 +259,12 @@ async function send(text: string) {
 function goBacktest(symbol?: string) {
   if (!symbol) return
   router.push({ path: '/backtest', query: { symbol } })
+}
+
+/** 在多策略回测里找 Sharpe 最高的（最值得关注的） */
+function isBest(bt: any, all: any[]) {
+  const bestSharpe = Math.max(...all.map((x: any) => x.metrics.sharpe_ratio))
+  return Math.abs(bt.metrics.sharpe_ratio - bestSharpe) < 0.001 && bt.metrics.sharpe_ratio > 0
 }
 
 function clearMessages() {
@@ -386,4 +450,38 @@ function avatarStyle(role: string) {
   0%, 80%, 100% { opacity: 0.25; }
   40% { opacity: 1; }
 }
+
+/* ✨ 回测结果对比卡片 */
+.bt-card {
+  margin-top: 12px; padding: 12px 14px;
+  background: #f8fafc; border: 1px solid #e4e7ed; border-radius: 8px;
+  font-size: 13px;
+}
+.bt-header {
+  display: flex; align-items: center; gap: 6px;
+  font-weight: 600; color: #303133; margin-bottom: 8px; font-size: 13px;
+}
+.bt-table {
+  display: flex; flex-direction: column; gap: 4px;
+}
+.bt-row {
+  display: grid; grid-template-columns: 1fr 70px 70px 60px 60px 48px;
+  gap: 4px; padding: 4px 6px;
+  border-radius: 4px;
+}
+.bt-row.bt-head {
+  font-size: 11px; color: #909399; padding: 2px 6px;
+}
+.bt-row.best {
+  background: linear-gradient(90deg, #ecfdf5, transparent 80%);
+  border: 1px solid #a7f3d0;
+}
+.bt-row.best .bt-name::after {
+  content: ' ★'; color: #10b981; font-size: 11px;
+}
+.bt-row .r { text-align: right; font-variant-numeric: tabular-nums; }
+.bt-row .pos { color: #dc2626; font-weight: 500; }
+.bt-row .neg { color: #16a34a; }
+.bt-name { font-weight: 500; color: #303133; }
+.bt-actions { margin-top: 8px; padding-top: 8px; border-top: 1px dashed #e4e7ed; }
 </style>

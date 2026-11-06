@@ -88,6 +88,7 @@ async def chat(req: ChatRequest, request: Request, user: User = Depends(get_curr
         "confidence": result.get("intent_confidence"),
         "needs_clarification": result.get("needs_clarification", False),
         "sources": result.get("rag_sources", []),
+        "backtest_results": result.get("backtest_results", []),  # ✨ 前端卡片展示
     }
     # 只缓存成功回答；超时兜底是暂态，不缓存
     if result.get("response_type") != "timeout":

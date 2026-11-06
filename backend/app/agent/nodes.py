@@ -153,11 +153,12 @@ async def node_market(state: AgentState) -> Dict[str, Any]:
             "response": "\n".join(lines), "response_type": "text"}
 
 
-# ========== 节点 2c：投资分析（并行 fan-out → 汇总给 LLM）========
+# ========== 节点 2c：投资分析（并行 fan-out → 汇总给 LLM → 可选回测验证）========
 async def node_analysis(state: AgentState) -> Dict[str, Any]:
-    """并行跑 portfolio + market + rag + news，让 LLM 结合新闻做决策建议。"""
+    """并行跑 portfolio + market + rag + news + **自动回测验证**，让 LLM 基于实锤数据给建议。"""
     message = state.get("message", "")
     user_id = state.get("user_id", "")
+    symbols = _extract_symbols(message)
 
     # 4 路并发：组合 + 行情 + RAG 知识 + 实时财经快讯（画像也顺带取）
     # 每路加独立超时：任一数据源卡住都只降级该路，不拖垮整次回答
@@ -173,7 +174,6 @@ async def node_analysis(state: AgentState) -> Dict[str, Any]:
             _safe(_fetch_portfolio(user_id), 12, {"total_value": 0.0, "pnl_percent": 0.0})
         )
         t_profile = tg.create_task(_safe(get_profile_summary(user_id), 5, ""))
-        symbols = _extract_symbols(message)
         t_market = tg.create_task(_safe(get_quote(symbols[0]), 8, None)) if symbols else None
         t_rag = tg.create_task(_safe(retrieve(message), 6, {}))
         t_news = tg.create_task(_safe(fetch_news(limit=10), 6, []))
@@ -184,6 +184,12 @@ async def node_analysis(state: AgentState) -> Dict[str, Any]:
         t_macro = tg.create_task(_safe(get_macro_overview(), 12, {}))
         t_funds = tg.create_task(_safe(get_fund_flow_overview(), 12, {}))
 
+        # ✨ 新增：自动回测验证 —— 对当前股票跑 2-3 个代表性策略
+        t_bt = (
+            tg.create_task(_safe(_run_quick_backtests(symbols[0]), 30, []))
+            if symbols else None
+        )
+
     portfolio = t_portfolio.result()
     profile_summary = t_profile.result()
     quote = t_market.result() if t_market else None
@@ -192,6 +198,7 @@ async def node_analysis(state: AgentState) -> Dict[str, Any]:
     indicators = t_ind.result() if t_ind else {}
     macro = t_macro.result()
     funds = t_funds.result()
+    backtest_results = t_bt.result() if t_bt else []
 
     # 构建 LLM 上下文
     context_parts = [f"用户问题：{message}"]
@@ -280,6 +287,19 @@ async def node_analysis(state: AgentState) -> Dict[str, Any]:
     news_text = format_news_for_prompt(news_items, max_items=8)
     context_parts.append(news_text)
 
+    # ✨ 新增：回测验证结果 —— 这是最硬的数据支撑
+    if backtest_results:
+        bt_lines = ["自动回测验证（过去 120 个交易日，初始资金 ¥200,000）："]
+        for bt in backtest_results:
+            m = bt["metrics"]
+            bt_lines.append(
+                f"  · {bt['strategy_name']}（{bt['strategy_id']}）："
+                f"总收益 {m['total_return_pct']:+.2f}%，年化 {m['annual_return_pct']:+.2f}%，"
+                f"Sharpe {m['sharpe_ratio']:.2f}，最大回撤 {m['max_drawdown_pct']:.2f}%，"
+                f"胜率 {m['win_rate_pct']:.0f}%，交易 {m['trades_count']} 笔"
+            )
+        context_parts.append("\n".join(bt_lines))
+
     # 调用 LLM 生成分析
     llm = get_llm()
     disclaimer = state.get("disclaimer", "")
@@ -290,12 +310,16 @@ async def node_analysis(state: AgentState) -> Dict[str, Any]:
         f"硬性规则（违反任何一条都视为不合格回答）：\n"
         f"1. 只能引用 <data> 中出现的数字、事实和新闻；严禁编造财务指标、目标价、机构预测、行业景气度数据\n"
         f"2. <data> 中没有提供的数据，直接写「数据不足」，不得用常识推测补齐\n"
-        f"3. 结论必须至少引用 2 个 <data> 中的具体数据点（如 MA20、RSI14、近20日涨跌幅、PE、组合仓位）\n"
+        f"3. 结论必须至少引用 2 个 <data> 中的具体数据点（如 MA20、RSI14、近20日涨跌幅、PE、回测收益、组合仓位）\n"
         f"4. 严格区分「数据显示」与「经验判断」，后者必须标注为推测\n"
         f"5. 不承诺收益、不给精确目标价，必须指出主要风险和不确定性\n"
-        f"6. 给出 2-3 种可选策略（保守/稳健/积极），每种一句话，并给出可供回测验证的具体参数"
-        f"（标的代码、策略类型如双均线/RSI/动量、关键参数、回测区间）\n"
-        f"7. 全文控制在 500 字以内，先给结论，再给数据依据，最后附免责声明\n"
+        f"6. 如果 <data> 中有「自动回测验证」结果：**这是核心依据，必须优先引用**，"
+        f"直接基于回测 Sharpe/收益/回撤数据判断哪类策略在这只股票上最有效，"
+        f"不要再建议「可以用 X 策略回测」——系统已经替你跑过了\n"
+        f"7. 如果 <data> 中没有回测数据（该股票可能数据太少或数据源离线），"
+        f"可以建议 2-3 种可选策略（保守/稳健/积极），并给出可供回测验证的具体参数"
+        f"（策略类型如双均线/RSI/动量、关键参数、回测区间）\n"
+        f"8. 全文控制在 500 字以内，先给结论，再给数据依据，最后附免责声明\n"
     )
     reply = await llm.achat(
         [{"role": "user", "content": prompt}],
@@ -314,9 +338,46 @@ async def node_analysis(state: AgentState) -> Dict[str, Any]:
         "rag_context": rag.get("context", ""),
         "news_count": len(news_items),
         "news_sources": list({n.get("source", "") for n in news_items}),
+        "backtest_results": backtest_results,  # ✨ 前端展示用
         "response": reply,
         "response_type": "markdown",
     }
+
+
+async def _run_quick_backtests(symbol: str) -> list:
+    """对当前股票跑 3 个代表性策略（趋势/震荡/突破各一个），并行执行，120 天。"""
+    from ..backtest_engine import run_strategy_backtest, list_strategies
+
+    # 选 3 个覆盖不同市场风格的策略
+    quick_list = [
+        ("ma_cross", "均线金叉死叉"),      # 趋势（牛市好）
+        ("rsi_ma200", "RSI + MA200 过滤"),  # 震荡（超卖反弹好）
+        ("donchian_breakout", "唐奇安突破"),  # 突破（主升浪好）
+    ]
+
+    async def _one(strategy_id: str, strategy_name: str):
+        try:
+            result = await run_strategy_backtest(
+                symbol=symbol, strategy=strategy_id,
+                initial_capital=200_000, days=120,
+            )
+            return {
+                "strategy_id": strategy_id,
+                "strategy_name": strategy_name,
+                "metrics": result["metrics"],
+            }
+        except Exception as e:
+            logger.info(f"[quick_bt] {symbol} {strategy_id} 回测跳过：{e}")
+            return None
+
+    tasks = [_one(sid, sname) for sid, sname in quick_list]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    out = []
+    for r in results:
+        if isinstance(r, Exception) or r is None:
+            continue
+        out.append(r)
+    return out
 
 
 async def _fetch_portfolio(user_id: str) -> dict:
