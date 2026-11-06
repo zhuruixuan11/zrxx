@@ -150,6 +150,18 @@
         </el-col>
       </el-row>
 
+      <!-- K 线交易信号 -->
+      <el-card v-if="klineData.length" shadow="hover" style="margin-top: 16px">
+        <template #header>
+          <span style="font-weight: 600">K 线交易信号</span>
+          <span style="margin-left: 12px; font-size: 12px; font-weight: 400">
+            <span style="color: #d64541">▲ 买入</span>
+            <span style="color: #27ae60; margin-left: 8px">▼ 卖出</span>
+          </span>
+        </template>
+        <v-chart :option="klineOption" theme="hengce" style="height: 420px" autoresize />
+      </el-card>
+
       <!-- 权益曲线 + 交易表 -->
       <el-row :gutter="16" style="margin-top: 16px">
         <el-col :xs="24" :md="16">
@@ -308,11 +320,15 @@ import {
   type StrategyInfo,
 } from '@/api/backtest'
 import { portfolioApi } from '@/api/portfolio'
+import { marketApi } from '@/api/market'
+import type { KlinePoint } from '@/types'
 
 const router = useRouter()
 
 const running = ref(false)
 const result = ref<BacktestResult | null>(null)
+// K 线数据（回测成功后拉取，用于叠加买卖信号）
+const klineData = ref<KlinePoint[]>([])
 const strategyList = ref<StrategyInfo[]>([])
 const groups = ref<string[]>([])
 
@@ -379,10 +395,32 @@ async function runBacktest() {
       params: form.params,
     })
     ElMessage.success(`回测完成！共 ${result.value.trades.length} 笔交易，收益率 ${result.value.metrics.total_return_pct.toFixed(2)}%`)
+    loadKline()
   } catch {
     result.value = null
+    klineData.value = []
   } finally {
     running.value = false
+  }
+}
+
+/** 拉取回测窗口内的日 K，供交易信号叠加（失败不影响回测结果展示） */
+async function loadKline() {
+  klineData.value = []
+  if (!result.value) return
+  try {
+    const res = await marketApi.history(form.symbol, form.days * 2 + 60)
+    const bars = res?.data || []
+    const curve = result.value.equity_curve
+    if (curve.length) {
+      const from = curve[0].date
+      const to = curve[curve.length - 1].date
+      klineData.value = bars.filter(b => b.date >= from && b.date <= to)
+    } else {
+      klineData.value = bars
+    }
+  } catch {
+    /* K 线加载失败时隐藏信号图，回测结果照常展示 */
   }
 }
 
@@ -536,6 +574,108 @@ const compareOption = computed(() => {
         itemStyle: { color: colors[i] },
       }
     }),
+  }
+})
+
+// K 线 + 买卖信号图
+const klineOption = computed(() => {
+  const bars = klineData.value
+  if (!bars.length || !result.value) return {}
+
+  const trades = result.value.trades
+  const dates = bars.map(b => b.date.slice(5))
+  // ECharts candlestick 数据约定：[open, close, low, high]
+  const ohlc = bars.map(b => [b.open, b.close, b.low, b.high])
+
+  const barByDate = new Map(bars.map(b => [b.date, b]))
+  const tradeMap = new Map<string, typeof trades>()
+  for (const t of trades) {
+    const arr = tradeMap.get(t.date) || []
+    arr.push(t)
+    tradeMap.set(t.date, arr)
+  }
+
+  // 买点标在当日最低价下方（红▲），卖点标在最高价上方（绿▼）
+  const buys: any[] = []
+  const sells: any[] = []
+  for (const t of trades) {
+    const bar = barByDate.get(t.date)
+    if (!bar) continue
+    if (t.action === 'BUY') {
+      buys.push({ coord: [t.date.slice(5), bar.low * 0.98], value: t.price })
+    } else {
+      sells.push({ coord: [t.date.slice(5), bar.high * 1.02], value: t.price })
+    }
+  }
+
+  return {
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'cross' },
+      formatter: (params: any[]) => {
+        const k = params.find(p => p.seriesType === 'candlestick')
+        if (!k) return ''
+        const [o, c, l, h] = (k.data as number[]).slice(-4)
+        const fullDate = bars[k.dataIndex].date
+        const lines = [
+          fullDate,
+          `开 ${o.toFixed(2)}　高 ${h.toFixed(2)}`,
+          `低 ${l.toFixed(2)}　收 ${c.toFixed(2)}`,
+        ]
+        for (const t of tradeMap.get(fullDate) || []) {
+          lines.push(
+            `${t.action === 'BUY' ? '▲ 买入' : '▼ 卖出'} ¥${t.price.toFixed(2)}` +
+              (t.shares ? ` × ${t.shares} 股` : ''),
+          )
+        }
+        return lines.join('<br/>')
+      },
+    },
+    grid: { left: 60, right: 30, top: 30, bottom: 40 },
+    xAxis: {
+      type: 'category',
+      data: dates,
+      axisLabel: { rotate: 30, fontSize: 11 },
+      axisLine: { lineStyle: { color: '#dcdfe6' } },
+    },
+    yAxis: {
+      scale: true,
+      splitLine: { lineStyle: { color: '#f0f2f5' } },
+      splitArea: { show: false },
+    },
+    series: [
+      {
+        name: 'K线',
+        type: 'candlestick',
+        data: ohlc,
+        // A 股配色：阳线红、阴线绿
+        itemStyle: {
+          color: '#e64545',
+          color0: '#27ae60',
+          borderColor: '#e64545',
+          borderColor0: '#27ae60',
+        },
+      },
+      {
+        name: '买入',
+        type: 'scatter',
+        symbol: 'triangle',
+        symbolSize: 13,
+        itemStyle: { color: '#d64541', borderColor: '#fff', borderWidth: 1 },
+        data: buys,
+        z: 10,
+      },
+      {
+        name: '卖出',
+        type: 'scatter',
+        symbol: 'triangle',
+        symbolRotate: 180,
+        symbolSize: 13,
+        itemStyle: { color: '#27ae60', borderColor: '#fff', borderWidth: 1 },
+        data: sells,
+        z: 10,
+      },
+    ],
   }
 })
 

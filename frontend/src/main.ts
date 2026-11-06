@@ -6,7 +6,7 @@ import * as ElementPlusIconsVue from '@element-plus/icons-vue'
 
 // ECharts 按需引入：只注册项目实际用到的图表与组件，显著减小打包体积
 import { use, registerTheme } from 'echarts/core'
-import { LineChart, PieChart } from 'echarts/charts'
+import { LineChart, PieChart, CandlestickChart, ScatterChart } from 'echarts/charts'
 import {
   GridComponent,
   TooltipComponent,
@@ -24,6 +24,8 @@ use([
   CanvasRenderer,
   LineChart,
   PieChart,
+  CandlestickChart,
+  ScatterChart,
   GridComponent,
   TooltipComponent,
   LegendComponent,
