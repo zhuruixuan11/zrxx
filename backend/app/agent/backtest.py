@@ -39,60 +39,18 @@ async def fetch_history_bars(symbol: str, days: int = 90, frequency: str = "d") 
 
 
 async def _fetch_bs_bars(bs_code: str, start: datetime, end: datetime, frequency: str) -> List[Dict[str, float]]:
-    """带超时的 baostock 取数。失败/超时返回空列表（让上层走兜底）。"""
-    import baostock as bs
+    """统一走 baostock 网关（单会话 + 限速 + 熔断）。失败返回空列表让上层兜底。"""
+    from .. import baostock_gateway
 
-    loop = asyncio.get_event_loop()
-
-    def _do_login_and_query():
-        try:
-            lg = bs.login()
-            if lg.error_code != "0":
-                return None, f"login failed: {lg.error_msg}"
-            try:
-                rs = bs.query_history_k_data_plus(
-                    bs_code,
-                    "date,open,high,low,close,volume",
-                    start_date=start.strftime("%Y-%m-%d"),
-                    end_date=end.strftime("%Y-%m-%d"),
-                    frequency=frequency,
-                    adjustflag="3",  # 前复权
-                )
-                if rs.error_code != "0":
-                    return None, f"query failed: {rs.error_msg}"
-                bars = []
-                while rs.next():
-                    row = rs.get_row_data()
-                    try:
-                        bars.append({
-                            "date": row[0],
-                            "open": float(row[1]),
-                            "high": float(row[2]),
-                            "low": float(row[3]),
-                            "close": float(row[4]),
-                            "volume": float(row[5]) if row[5] else 0.0,
-                        })
-                    except (ValueError, IndexError):
-                        continue
-                return bars, None
-            finally:
-                bs.logout()
-        except Exception as e:
-            return None, str(e)
-
-    try:
-        result, err = await asyncio.wait_for(
-            loop.run_in_executor(None, _do_login_and_query), timeout=25)
-    except asyncio.TimeoutError:
-        logger.warning(f"baostock timeout ({bs_code})")
-        # 超时后毒化会话，强制清理
-        try:
-            bs.logout()
-        except Exception:
-            pass
+    bars = await baostock_gateway.fetch_bars(
+        bs_code,
+        start.strftime("%Y-%m-%d"),
+        end.strftime("%Y-%m-%d"),
+        frequency=frequency,
+        adjustflag="3",
+        timeout=25,
+    )
+    if bars is None:
+        logger.warning(f"baostock 不可用 ({bs_code})，本次回测取数降级")
         return []
-
-    if err:
-        logger.warning(f"baostock fetch failed ({bs_code}): {err}")
-        return []
-    return result or []
+    return bars

@@ -7,8 +7,6 @@
 """
 from __future__ import annotations
 
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -17,8 +15,6 @@ from fastapi import APIRouter, Query
 from loguru import logger
 
 router = APIRouter(prefix="/api/signals", tags=["signals"])
-
-_executor = ThreadPoolExecutor(max_workers=2)
 
 # 监控的主要指数
 # baostock 指数代码前缀：sh. / sz.
@@ -31,59 +27,27 @@ WATCH_INDICES = [
 ]
 
 
-def _fetch_all_indices_once() -> Dict[str, List[Dict[str, float]]]:
-    """一次 login 拉所有监控指数（baostock login 慢 ~20s，必须复用）。"""
-    import baostock as bs
+async def _fetch_all_indices_once() -> Dict[str, List[Dict[str, float]]]:
+    """拉所有监控指数日线，统一走 baostock 网关（单会话 + 限速 + 熔断）。"""
+    from .. import baostock_gateway
 
     today = datetime.now()
     start = today - timedelta(days=70)
     start_str = start.strftime("%Y-%m-%d")
     end_str = today.strftime("%Y-%m-%d")
 
-    lg = bs.login()
-    if lg.error_code != "0":
-        logger.warning(f"[signals] baostock login failed: {lg.error_msg}")
-        return {}
-
     results: Dict[str, List[Dict[str, float]]] = {}
-    try:
-        for idx in WATCH_INDICES:
-            bs_code = idx["code"]
-            try:
-                rs = bs.query_history_k_data_plus(
-                    bs_code,
-                    "date,open,high,low,close,volume",
-                    start_date=start_str,
-                    end_date=end_str,
-                    frequency="d",
-                    adjustflag="3",
-                )
-                if rs.error_code != "0":
-                    logger.debug(f"[signals] query {bs_code} failed: {rs.error_msg}")
-                    continue
-                bars = []
-                while rs.next():
-                    row = rs.get_row_data()
-                    try:
-                        bars.append({
-                            "date": row[0],
-                            "open": float(row[1]),
-                            "high": float(row[2]),
-                            "low": float(row[3]),
-                            "close": float(row[4]),
-                            "volume": float(row[5]) if row[5] else 0.0,
-                        })
-                    except (ValueError, IndexError):
-                        continue
-                if len(bars) >= 20:
-                    results[idx["name"]] = bars
-            except Exception as e:
-                logger.debug(f"[signals] {bs_code} error: {e}")
-                continue
-    finally:
-        bs.logout()
+    for idx in WATCH_INDICES:
+        bars = await baostock_gateway.fetch_bars(
+            idx["code"], start_str, end_str, frequency="d", adjustflag="3", timeout=20,
+        )
+        if bars is None:
+            logger.warning("[signals] baostock 不可用（限流/熔断），本轮跳过剩余指数")
+            break
+        if len(bars) >= 20:
+            results[idx["name"]] = bars
 
-    logger.info(f"[signals] fetched {len(results)}/{len(WATCH_INDICES)} indices in one login")
+    logger.info(f"[signals] fetched {len(results)}/{len(WATCH_INDICES)} indices")
     return results
 
 
@@ -149,9 +113,8 @@ def _analyze_index(bars: List[Dict[str, float]], name: str) -> Optional[Dict[str
 
 
 async def _scan_all_indices() -> List[Dict[str, Any]]:
-    """扫描所有监控指数，返回带信号的分析结果。一次 login 全拉完。"""
-    loop = asyncio.get_event_loop()
-    all_data = await loop.run_in_executor(_executor, _fetch_all_indices_once)
+    """扫描所有监控指数，返回带信号的分析结果（baostock 网关统一取数）。"""
+    all_data = await _fetch_all_indices_once()
 
     results = []
     for name, bars in all_data.items():

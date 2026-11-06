@@ -442,12 +442,13 @@ async def screener_strategic(
     _BATCH_SIZE = 80
     _MAX_SCAN = min(len(bs_groups), 2000)  # 先扫前 2000 只（沪深 + 热门，北交所放后面）
     hits: List[Dict[str, Any]] = []
+    scanned = 0
+    degraded = False
 
     for batch_start in range(0, _MAX_SCAN, _BATCH_SIZE):
         if len(hits) >= top_n * 3:
             break
         batch = bs_groups[batch_start : batch_start + _BATCH_SIZE]
-        batch_codes = [bc for bc, _ in batch]
 
         # 跳过已缓存的
         uncached_codes = []
@@ -462,11 +463,16 @@ async def screener_strategic(
         # 批量拉 uncached
         if uncached_codes:
             batch_result = await _bs_query_batch(uncached_codes, need_days)
+            if batch_result is None:
+                # baostock 已熔断/登录失败：立即停止扫描，返回已有命中，不再空耗
+                logger.warning("[screener] baostock 不可用（限流/熔断），提前结束扫描")
+                degraded = True
+                break
             for bc, bars in batch_result.items():
                 _cache_set(f"screener_hist:{bc}:{need_days}", bars)
             cached_bars.update(batch_result)
-            # baostock 限流保护
-            await asyncio.sleep(0.1)
+
+        scanned += len(batch)
 
         import pandas as pd
         for bc, item in batch:
@@ -493,7 +499,8 @@ async def screener_strategic(
             "signal": signal,
             "signal_name": name,
             "signal_desc": desc,
-            "total_scanned": len(full_items),
+            "total_scanned": scanned,
+            "degraded": degraded,
             "results": hits,
         },
     }
@@ -538,114 +545,32 @@ async def fetch_history_bars_for_screener(symbol: str, days: int = 20) -> List[D
 
 
 async def _bs_query_one(bs_code: str, days: int) -> list:
-    """单只 baostock 查询（内部：login → query → logout）。"""
+    """单只查询，统一走 baostock 网关。不可用时返回 []（上层走新浪兜底）。"""
     from datetime import datetime, timedelta
-    try:
-        import baostock as bs
-    except ImportError:
-        return []
+    from .. import baostock_gateway
 
     start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
     end = datetime.now().strftime("%Y-%m-%d")
-    loop = asyncio.get_event_loop()
-
-    def _sync():
-        try:
-            lg = bs.login()
-            if lg.error_code != "0":
-                return []
-            try:
-                rs = bs.query_history_k_data_plus(
-                    bs_code, "date,open,high,low,close,volume",
-                    start_date=start, end_date=end, frequency="d", adjustflag="3",
-                )
-                if rs.error_code != "0":
-                    return []
-                rows = []
-                while rs.next():
-                    r = rs.get_row_data()
-                    try:
-                        rows.append({
-                            "date": r[0], "open": float(r[1]), "high": float(r[2]),
-                            "low": float(r[3]), "close": float(r[4]),
-                            "volume": float(r[5]) if r[5] else 0.0,
-                        })
-                    except (ValueError, IndexError):
-                        continue
-                return rows
-            finally:
-                bs.logout()
-        except Exception:
-            return []
-
-    try:
-        result = await asyncio.wait_for(loop.run_in_executor(None, _sync), timeout=10)
-        return result or []
-    except asyncio.TimeoutError:
-        try:
-            bs.logout()
-        except Exception:
-            pass
-        return []
+    bars = await baostock_gateway.fetch_bars(
+        bs_code, start, end, frequency="d", adjustflag="3", timeout=15,
+    )
+    return bars or []
 
 
-async def _bs_query_batch(bs_codes: list[str], days: int) -> dict[str, list]:
-    """批量查询（一次 login → N 次 query → 一次 logout），比单只快 10x+。"""
+async def _bs_query_batch(bs_codes: list[str], days: int) -> dict[str, list] | None:
+    """批量查询，统一走 baostock 网关（单会话 + 限速 + 熔断）。
+
+    返回 None 表示 baostock 当前不可用（已熔断/登录失败），调用方应中断扫描，
+    避免继续对 2000 只股票做无谓尝试。
+    """
     from datetime import datetime, timedelta
-    try:
-        import baostock as bs
-    except ImportError:
-        return {}
+    from .. import baostock_gateway
 
     start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
     end = datetime.now().strftime("%Y-%m-%d")
-
-    def _sync_all():
-        result: dict[str, list] = {}
-        try:
-            lg = bs.login()
-            if lg.error_code != "0":
-                return result
-            for bc in bs_codes:
-                try:
-                    rs = bs.query_history_k_data_plus(
-                        bc, "date,open,high,low,close,volume",
-                        start_date=start, end_date=end, frequency="d", adjustflag="3",
-                    )
-                    if rs.error_code != "0":
-                        continue
-                    rows = []
-                    while rs.next():
-                        r = rs.get_row_data()
-                        try:
-                            rows.append({
-                                "date": r[0], "open": float(r[1]), "high": float(r[2]),
-                                "low": float(r[3]), "close": float(r[4]),
-                                "volume": float(r[5]) if r[5] else 0.0,
-                            })
-                        except (ValueError, IndexError):
-                            continue
-                    if rows:
-                        result[bc] = rows
-                except Exception:
-                    continue
-            bs.logout()
-        except Exception:
-            try:
-                bs.logout()
-            except Exception:
-                pass
-        return result
-
-    loop = asyncio.get_event_loop()
-    try:
-        return await asyncio.wait_for(loop.run_in_executor(_executor, _sync_all), timeout=120)
-    except asyncio.TimeoutError:
-        try:
-            bs.logout()
-        except Exception:
-            pass
-        return {}
+    return await baostock_gateway.fetch_bars_many(
+        bs_codes, start, end, frequency="d", adjustflag="3", timeout=120,
+    )
 
 
 # ===================== 启动预热 =====================

@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import re
-import threading
 import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
@@ -72,9 +71,6 @@ _HIST_CACHE: "OrderedDict[str, tuple[float, Dict[str, Any]]]" = OrderedDict()
 _QUOTE_TTL = 30.0    # 行情缓存 30 秒
 _HIST_TTL = 300.0    # 历史 K 线缓存 5 分钟
 _CACHE_MAX = 512     # 单表最多缓存条数，超出按最久未使用淘汰
-
-# baostock 的会话对象不是线程安全的，并发查询时用它串行化
-_BS_LOCK = threading.Lock()
 
 
 def _cache_get(cache: "OrderedDict[str, tuple[float, Dict[str, Any]]]", key: str, ttl: float):
@@ -158,79 +154,13 @@ async def get_historical(symbol: str, days: int = 30) -> Dict[str, Any]:
     return {"error": "未找到可用数据源", "symbol": symbol}
 
 
-# ========== baostock 会话池（复用连接，避免每次 login 20s）==========
-_bs_cache: Dict[str, Any] = {}
-
-def _bs_get():
-    """获取/创建 baostock 登录会话（复用，避免每次 login ~20s）。"""
-    import baostock as bs
-    cached = _bs_cache.get("session")
-    if cached is not None:
-        # 简单健康检查：发个轻量 query 确认连接没断
-        try:
-            rs = cached.query_history_k_data_plus(
-                "sh.600519", "date,close",
-                start_date="2026-11-01", end_date="2026-11-04", frequency="d",
-            )
-            if rs.error_code == "0":
-                return cached
-        except Exception:
-            pass
-    # 重新 login
-    lg = bs.login()
-    if lg.error_code != "0":
-        logger.warning(f"baostock login failed: {lg.error_msg}")
-        return None
-    _bs_cache["session"] = bs
-    return bs
-
-
+# ========== baostock 统一网关 ==========
+# 会话、限速、熔断全部由 app.baostock_gateway 统一管理：
+# 全进程只有一个会话，任何一处都不会再把别人的连接踢掉。
 def _bs_close():
-    """关闭并清空缓存会话。"""
-    cached = _bs_cache.pop("session", None)
-    if cached is not None:
-        try:
-            cached.logout()
-        except Exception:
-            pass
-
-
-def _bs_run_in_executor(fn):
-    """用已登录的 bs 会话跑查询（在线程池中）。
-
-    baostock 是进程级单例，登录/查询/重连必须整体串行，
-    否则行情和 K 线并发时两次 login 会互相踩掉会话。
-    """
-    import baostock as bs
-    try:
-        with _BS_LOCK:
-            if _bs_cache.get("session") is None:
-                lg = bs.login()
-                if lg.error_code != "0":
-                    logger.warning(f"baostock login failed: {lg.error_msg}")
-                    return None
-                _bs_cache["session"] = bs
-            try:
-                return fn(bs)
-            except Exception as e:
-                logger.warning(f"baostock query error, reconnecting: {e}")
-                try:
-                    bs.logout()
-                except Exception:
-                    pass
-                _bs_cache.pop("session", None)
-                lg = bs.login()
-                if lg.error_code != "0":
-                    return None
-                _bs_cache["session"] = bs
-                try:
-                    return fn(bs)
-                except Exception as e2:
-                    logger.warning(f"baostock retry also failed: {e2}")
-                    return None
-    except Exception as e:
-        logger.warning(f"baostock session error: {e}")
-        return None
+    """会话毒化后调用：清状态并打开熔断，让后续请求快速走新浪兜底。"""
+    from .. import baostock_gateway
+    baostock_gateway.reset()
 
 
 async def _bs_quote(symbol: str) -> Optional[Dict[str, Any]]:
@@ -245,30 +175,18 @@ async def _bs_quote(symbol: str) -> Optional[Dict[str, Any]]:
     start_str = start.strftime("%Y-%m-%d")
     end_str = today.strftime("%Y-%m-%d")
 
-    def _do_query(bs):
-        return bs.query_history_k_data_plus(
-            bs_code, "date,open,high,low,close,volume,amount",
-            start_date=start_str, end_date=end_str, frequency="d", adjustflag="3",
-        )
-
-    loop = asyncio.get_event_loop()
     # 东方财富实时盘口与 baostock 日线并行，缩短单只行情耗时
     em_task = asyncio.create_task(_em_push2_realtime(bs_code))
-    # baostock 服务端偶发挂起（限流/网络），必须加超时，否则锁死执行器并阻塞兜底链路
-    try:
-        rs = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: _bs_run_in_executor(_do_query)), timeout=25)
-    except asyncio.TimeoutError:
-        _bs_close()  # 挂死的会话不能留着，下次重新 login
-        logger.warning(f"baostock quote timeout ({symbol})")
-        raise
-    bs_failed = rs is None or rs.error_code != "0"
-    rows: List[List[str]] = []
+    # 统一走 baostock 网关：单会话复用 + 限速 + 熔断，不会再和其他模块互踢连接
+    from .. import baostock_gateway
+    rows = await baostock_gateway.fetch_rows(
+        bs_code, "date,open,high,low,close,volume,amount",
+        start_str, end_str, frequency="d", adjustflag="3", timeout=20,
+    )
+    bs_failed = rows is None
     if bs_failed:
-        logger.warning(f"baostock quote query failed: {getattr(rs, 'error_msg', 'unknown')}")
-    else:
-        while rs.next():
-            rows.append(rs.get_row_data())
+        logger.warning(f"baostock quote unavailable ({symbol})，走兜底数据源")
+        rows = []
 
     realtime = await _await_optional(em_task)
 
@@ -357,27 +275,15 @@ async def _bs_history(symbol: str, days: int = 30) -> Optional[Dict[str, Any]]:
     start_str = start.strftime("%Y-%m-%d")
     end_str = today.strftime("%Y-%m-%d")
 
-    def _do_query(bs):
-        return bs.query_history_k_data_plus(
-            bs_code, "date,open,high,low,close,volume",
-            start_date=start_str, end_date=end_str, frequency="d", adjustflag="3",
-        )
-
-    loop = asyncio.get_event_loop()
-    # 同上：baostock 挂起时超时返回 None，让上层走新浪 K 线兜底
-    try:
-        rs = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: _bs_run_in_executor(_do_query)), timeout=25)
-    except asyncio.TimeoutError:
-        _bs_close()  # 挂死的会话不能留着，下次重新 login
-        logger.warning(f"baostock history timeout ({symbol} {days}d)，尝试兜底数据源")
+    # 统一走 baostock 网关（单会话 + 限速 + 熔断）
+    from .. import baostock_gateway
+    rows = await baostock_gateway.fetch_rows(
+        bs_code, "date,open,high,low,close,volume",
+        start_str, end_str, frequency="d", adjustflag="3", timeout=20,
+    )
+    if rows is None:
+        logger.warning(f"baostock history unavailable ({symbol} {days}d)，尝试兜底数据源")
         return None
-    if rs is None or rs.error_code != "0":
-        return None
-
-    rows: List[List[str]] = []
-    while rs.next():
-        rows.append(rs.get_row_data())
 
     data = []
     for r in rows[-days:]:
