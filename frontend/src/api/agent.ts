@@ -8,6 +8,25 @@ export interface ChatHistoryItem {
   content: string
   intent?: string
   created_at?: string
+  /** 服务端持久化的回测卡片数据（有卡片的历史消息才带） */
+  symbols?: string[]
+  symbol_names?: string[]
+  backtest_results?: Array<{
+    symbol: string
+    symbol_name: string
+    results: Array<{
+      strategy_id: string
+      strategy_name: string
+      metrics: {
+        total_return_pct: number
+        annual_return_pct: number
+        sharpe_ratio: number
+        max_drawdown_pct: number
+        win_rate_pct: number
+        trades_count: number
+      }
+    }>
+  }>
 }
 
 export const agentApi = {

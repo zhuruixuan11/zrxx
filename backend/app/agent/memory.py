@@ -11,9 +11,10 @@ from ..models.chat import ChatHistory
 
 
 async def save_message(session, user_id: str, role: str, content: str,
-                       intent: str | None = None, sources: str | None = None) -> None:
+                       intent: str | None = None, sources: str | None = None,
+                       payload: str | None = None) -> None:
     msg = ChatHistory(user_id=user_id, role=role, content=content,
-                      intent=intent, sources=sources)
+                      intent=intent, sources=sources, payload=payload)
     session.add(msg)
     await session.flush()
 

@@ -22,6 +22,9 @@ class ChatHistory(Base):
     # Agent 端额外信息
     intent: Mapped[str | None] = mapped_column(String(32), nullable=True)
     sources: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON 字符串
+    # 结构化卡片数据（backtest_results/symbols/symbol_names），JSON 字符串，
+    # 历史接口恢复时前端据此重新渲染回测卡片
+    payload: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 

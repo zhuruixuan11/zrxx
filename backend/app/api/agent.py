@@ -70,14 +70,24 @@ async def chat(req: ChatRequest, request: Request, user: User = Depends(get_curr
                 "intent": "chitchat",
             }
 
-        # 保存 AI 回复
+        # 保存 AI 回复（回测卡片等结构化数据一并落库，刷新/换设备后可恢复）
+        import json as _json
         intent = result.get("intent")
         sources = result.get("rag_sources")
+        card_payload = {
+            "backtest_results": result.get("backtest_results") or [],
+            "symbols": result.get("symbols") or [],
+            "symbol_names": result.get("symbol_names") or [],
+        }
         await save_message(
             session, user.id, "assistant",
             result.get("response", "抱歉，我暂时无法回答。"),
             intent=intent,
             sources=str(sources) if sources else None,
+            payload=(
+                _json.dumps(card_payload, ensure_ascii=False)
+                if any(card_payload.values()) else None
+            ),
         )
         await session.commit()
 
@@ -112,12 +122,23 @@ async def history(limit: int = 20, user: User = Depends(get_current_user)):
             .order_by(ChatHistory.created_at.desc()).limit(limit)
         )).scalars().all()
     out = []
+    import json as _json
     for r in rows:
-        out.append({
+        item = {
             "id": r.id,
             "role": r.role, "content": r.content[:500],
             "intent": r.intent, "created_at": r.created_at.strftime("%Y-%m-%d %H:%M"),
-        })
+        }
+        # 恢复结构化卡片（回测结果分组），前端据此重新渲染
+        if r.payload:
+            try:
+                p = _json.loads(r.payload)
+                item["backtest_results"] = p.get("backtest_results") or []
+                item["symbols"] = p.get("symbols") or []
+                item["symbol_names"] = p.get("symbol_names") or []
+            except (ValueError, TypeError):
+                pass
+        out.append(item)
     # 倒序查、正序返回，前端可直接渲染
     out.reverse()
     return {"code": 0, "msg": "ok", "data": {"list": out, "total": len(out)}}

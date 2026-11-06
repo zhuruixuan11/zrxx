@@ -210,7 +210,7 @@ nextTick(() => {
   inputRef.value?.focus()
 })
 
-/** 本地没有记录时，从服务端恢复最近对话（换设备/清缓存后仍可续上） */
+/** 本地没有记录时，从服务端恢复最近对话（换设备/清缓存后仍可续上，含回测卡片） */
 async function loadServerHistory() {
   if (messages.value.length) return
   try {
@@ -220,6 +220,10 @@ async function loadServerHistory() {
         role: m.role,
         content: m.content,
         intent: m.intent,
+        symbol: m.symbols?.[0],
+        symbols: m.symbols,
+        symbol_names: m.symbol_names,
+        backtest_results: m.backtest_results || [],
       }))
       persistMessages()
       scrollBottom()
