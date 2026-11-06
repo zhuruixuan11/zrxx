@@ -46,3 +46,13 @@ class AgentState(TypedDict, total=False):
     error: Optional[str]
     # 对话历史注入（由 memory 模块预填充）
     history_context: str
+    # 免责声明（由 graph 初始化时从配置注入，节点内读取）
+    disclaimer: str
+    # 分析节点产出：股票列表与按 symbol 分组的回测结果
+    # （必须显式声明，否则 LangGraph 会把未声明的 key 从返回值里静默丢弃）
+    symbols: List[str]
+    symbol_names: List[str]
+    backtest_results: List[Dict[str, Any]]
+    # 新闻注入统计
+    news_count: int
+    news_sources: List[str]
