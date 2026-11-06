@@ -92,4 +92,22 @@ export const marketApi = {
   boardsZt() {
     return request.get<{ items: ZtItem[] }>('/api/market/boards/zt')
   },
+
+  /** 列出可用的策略选股信号（前端下拉用） */
+  screenerSignals() {
+    return request.get<{ signals: Array<{ id: string; name: string; desc: string; need_days: number }> }>(
+      '/api/market/screener/signals',
+    )
+  },
+
+  /** 按策略信号扫描全市场 */
+  screenerStrategic(params: { signal: string; top_n?: number }) {
+    return request.get<{
+      signal: string
+      signal_name: string
+      signal_desc: string
+      total_scanned: number
+      results: ScreenerItem[]
+    }>('/api/market/screener/strategic', { params })
+  },
 }

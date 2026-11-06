@@ -449,30 +449,12 @@ async def node_screener(state: AgentState) -> Dict[str, Any]:
     message = state.get("message", "")
     signal_id = _parse_screener_signal(message)
 
-    # 直接调 market screener 接口（复用已有缓存）
     from ..api.market import _STRATEGY_SIGNALS, _init_strategy_signals
     _init_strategy_signals()
     signal_meta = _STRATEGY_SIGNALS.get(signal_id)
     signal_name = signal_meta[0] if signal_meta else signal_id
 
-    # 用 httpx 调自己（绕过 router 直接调函数会比较复杂，走 HTTP 最稳）
     try:
-        import httpx
-        from ..config import get_settings
-        settings = get_settings()
-        # 内部 loop.run_in_executor 不安全——直接 import 并 await 内部函数
-        from ..api.market import screener_strategic as screener_impl
-        from fastapi import Request
-        from starlette.requests import Request as StarletteRequest
-
-        # 构造一个最小的 Request mock（被 limiter 用 get_ipaddr）
-        class _MockClient:
-            host = "127.0.0.1"
-        class _MockRequest:
-            client = _MockClient()
-            url = type("URL", (), {"path": "/"})()
-            def headers(self): return {}
-        # 直接跳过 limiter 装饰器调内部函数（内部函数不带装饰器）
         results = await _run_screener_direct(signal_id, top_n=15)
 
         if not results:

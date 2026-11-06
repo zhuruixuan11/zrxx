@@ -178,6 +178,68 @@
             <el-table-column prop="industry" label="所属行业" min-width="120" />
           </el-table>
         </el-tab-pane>
+
+        <!-- ============ Tab 4: 策略选股 ============ -->
+        <el-tab-pane label="策略选股" name="strategic">
+          <div class="filter-bar">
+            <el-select v-model="ssSignal" placeholder="选择策略信号" style="width: 240px">
+              <el-option
+                v-for="s in ssSignals"
+                :key="s.id"
+                :label="`${s.name} · ${s.desc}`"
+                :value="s.id"
+              />
+            </el-select>
+            <el-select v-model="ssTopN" style="width: 100px">
+              <el-option label="Top 10" :value="10" />
+              <el-option label="Top 20" :value="20" />
+              <el-option label="Top 30" :value="30" />
+            </el-select>
+            <el-button type="primary" :loading="ssLoading" @click="runStrategicScan">
+              <el-icon><Search /></el-icon>
+              扫描
+            </el-button>
+            <el-tag v-if="ssResult" type="success" size="large" style="margin-left: auto">
+              扫描 {{ ssResult.total_scanned.toLocaleString() }} 只，命中 {{ ssResult.results.length }} 只
+            </el-tag>
+          </div>
+          <div v-if="ssResult" class="ss-desc">
+            <el-icon style="vertical-align: -2px"><InfoFilled /></el-icon>
+            信号「{{ ssResult.signal_name }}」：{{ ssResult.signal_desc }}
+          </div>
+
+          <el-table
+            v-if="ssResult"
+            :data="ssResult.results"
+            v-loading="ssLoading"
+            stripe
+            size="small"
+            height="calc(100vh - 360px)"
+          >
+            <el-table-column prop="code" label="代码" width="90" />
+            <el-table-column prop="name" label="名称" width="130" />
+            <el-table-column label="最新价" width="100" align="right">
+              <template #default="{ row }">¥{{ (row.price ?? 0).toFixed(2) }}</template>
+            </el-table-column>
+            <el-table-column label="涨跌幅" width="100" align="right">
+              <template #default="{ row }">
+                <span class="change-badge" :class="cls(row.change_pct)">
+                  {{ row.change_pct >= 0 ? '+' : '' }}{{ row.change_pct.toFixed(2) }}%
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column label="成交额(亿)" width="110" align="right">
+              <template #default="{ row }">{{ ((row.amount ?? 0) / 1e8).toFixed(2) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="180">
+              <template #default="{ row }">
+                <el-button size="small" type="primary" link @click="goMarket(row.code)">行情</el-button>
+                <el-button size="small" type="success" link @click="goBacktest(row.code)">回测</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+          <el-empty v-else-if="!ssLoading" description="选择信号并点击扫描" />
+        </el-tab-pane>
       </el-tabs>
     </el-card>
   </div>
@@ -185,8 +247,11 @@
 
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
-import { Search, Grid } from '@element-plus/icons-vue'
+import { useRouter } from 'vue-router'
+import { Search, Grid, InfoFilled } from '@element-plus/icons-vue'
 import { marketApi, type ScreenerResult, type ConceptItem, type ZtItem } from '@/api/market'
+
+const router = useRouter()
 
 const tab = ref('screener')
 const loading = ref(false)
@@ -199,6 +264,19 @@ const conceptItems = ref<ConceptItem[]>([])
 const ztItems = ref<ZtItem[]>([])
 const conceptLoading = ref(false)
 const ztLoading = ref(false)
+
+// ===== 策略选股 =====
+const ssSignals = ref<Array<{ id: string; name: string; desc: string; need_days: number }>>([])
+const ssSignal = ref('breakout_20d')
+const ssTopN = ref(15)
+const ssLoading = ref(false)
+const ssResult = ref<{
+  signal: string
+  signal_name: string
+  signal_desc: string
+  total_scanned: number
+  results: any[]
+} | null>(null)
 
 async function loadScreener() {
   loading.value = true
@@ -230,9 +308,38 @@ async function loadZt() {
   finally { ztLoading.value = false }
 }
 
+async function loadSignals() {
+  try {
+    const res = await marketApi.screenerSignals()
+    ssSignals.value = res.signals
+  } catch { /* ignore */ }
+}
+
+async function runStrategicScan() {
+  if (!ssSignal.value) return
+  ssLoading.value = true
+  ssResult.value = null
+  try {
+    ssResult.value = await marketApi.screenerStrategic({
+      signal: ssSignal.value,
+      top_n: ssTopN.value,
+    })
+  } catch { /* ignore */ }
+  finally { ssLoading.value = false }
+}
+
+function goMarket(code: string) {
+  router.push({ path: '/market', query: { symbol: code } })
+}
+
+function goBacktest(code: string) {
+  router.push({ path: '/backtest', query: { symbol: code } })
+}
+
 function handleTabChange(t: string) {
   if (t === 'concept' && conceptItems.value.length === 0) loadConcept()
   if (t === 'zt' && ztItems.value.length === 0) loadZt()
+  if (t === 'strategic' && ssSignals.value.length === 0) loadSignals()
 }
 
 function marketTag(m: string) {
@@ -270,4 +377,9 @@ onMounted(loadScreener)
 
 .lead-name { margin-right: 8px; font-weight: 500 }
 .lead-code { font-size: 12px }
+
+.ss-desc {
+  padding: 8px 12px; margin-bottom: 12px;
+  background: #f0f9ff; border-radius: 4px; color: #606266; font-size: 13px;
+}
 </style>
