@@ -1,0 +1,31 @@
+# 衡策训练栈依赖（**不含 torch**）
+#
+# torch 由镜像提供或由 setup_gpu_env.sh 单独安装，本文件故意不锁 torch，
+# 以免把镜像自带的 cu124 版换成 PyPI 默认源上的 CPU 版。
+#
+# 目标环境（二选一）：
+#   A. 镜像自带：PyTorch 2.5.1 / Python 3.12 / CUDA 12.4（已实测解析通过）
+#   B. 镜像无可用 torch：setup_gpu_env.sh 用 cu126 索引装 torch==2.14.1
+#
+# 版本依据（2026-11-07 用 pip download / pip install --dry-run 实查 wheel 元数据）：
+#   - trl==1.16.0：1.17.x 的元数据要求 torch>=2.6.0，与镜像 2.5.1 冲突；1.16.0 无 torch 下限，
+#     要求 transformers>=4.56.2，可在 2.5.1 上装。
+#   - transformers==5.17.0：dependency_versions_table 里是 torch>=2.5，2.5.1 满足；
+#     该版本已内置 models/qwen3_5（DeltaNet + Attention 混合），**不需要 trust_remote_code**。
+#   - bitsandbytes==0.50.2：元数据 torch>=2.4，支持 CUDA 12.x；0.50.x 为单一 wheel，不再按 cu11x/cu12x 分渠道。
+#   - peft==0.21.2：torch>=1.13、accelerate>=0.21。
+#   - accelerate==1.15.0：torch>=2.0；datasets==5.1.0 对 torch 无硬依赖。
+#   - Requires-Python：transformers/peft/datasets/accelerate/bitsandbytes >=3.10，trl >=3.11，
+#     故 Python 3.12 与 3.11 都可。
+#
+# 解析验证（真实执行，均在 Python 3.12 目标下、torch==2.5.1 固定）：
+#   pip install --dry-run --python-version 312 --only-binary=:all: \
+#     -r requirements-training.txt torch==2.5.1        → 退出码 0，无冲突
+#   若镜像无 torch，替换为 torch==2.14.1 --index-url https://download.pytorch.org/whl/cu126。
+
+transformers==5.17.0
+peft==0.21.2
+trl==1.16.0
+bitsandbytes==0.50.2
+datasets==5.1.0
+accelerate==1.15.0

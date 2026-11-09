@@ -1,0 +1,93 @@
+# =============================================================================
+# 衡策 SFT 训练配置（prepare_data.py --mix 与 train_sft.py 共用）
+# 路径一律写「相对仓库根」的路径；也允许绝对路径，代码里按绝对/相对自动判断。
+# 数字来源：final80 精写集 80 条 + sft_synth_v2 辅助集 854/180/198 条。
+# =============================================================================
+
+# 全局随机种子：切分、骨架采样、DataLoader shuffle 都用它，保证可复现。
+seed: 42
+
+paths:
+  # 精写集（已封版，80 条，脚本只读不改）
+  core_source: backend/data/sft_v3/final80/samples.jsonl
+  # 辅助集目录，内含 train.jsonl / val.jsonl / test.jsonl
+  aux_dir: backend/data/sft_synth_v2
+  # OOD 评测集：88 条，只用于最终评测，任何训练/调参流程都不读
+  ood_eval: backend/data/eval_ood/ood.jsonl
+
+  # 切分产物：core/train.jsonl（68）、core/val.jsonl（12）
+  core_dir: backend/data/training/core
+  # 混合产物：mixed/train.jsonl（471）、mixed/stats.json
+  mixed_dir: backend/data/training/mixed
+  # train_sft.py 读取的两个文件（显式写出，避免再拼目录）
+  mixed_train: backend/data/training/mixed/train.jsonl
+  core_val: backend/data/training/core/val.jsonl
+  # 适配器与 train_summary.json 的输出目录
+  output_dir: backend/outputs/qwen3_5_4b_sft_mixed
+
+split:
+  # 精写集按「标的」切分，同一标的的全部样本只会落在一侧，防止标的级泄漏。
+  # 具体做法：对每个标的算 sha1(f"{seed}:{symbol}")，按哈希升序取前 val_size 个标的进 val。
+  # final80 恰好每个标的 1 条，因此结果精确为 68/12。
+  method: symbol_sha1
+  val_size: 12
+  # 记录用：12/80 = 15%，不参与计算
+  val_fraction: 0.15
+
+mix:
+  # 精写 train 68 条重复写入 5 遍 = 340 行（这是 exposure，不是 340 条新样本）
+  core_repeat: 5
+  aux:
+    # 每个问句骨架只取 1 条（候选用 train+val 后共 131 个骨架）
+    strategy: per_skeleton
+    per_skeleton: 1
+    seed: 42
+    # 候选池顺序：优先 train，train 没有该骨架时用 val 补。
+    # 只取 train+val，**故意剔除 v2 test**：test 是留给 v2 自己评测的集合，
+    # 用它做 SFT 等于把辅助集的测试样本混进训练（5 条），口径上说不清。
+    # 实测 train 854 条只覆盖 125 个骨架，6 个骨架仅在 val；剔除 test 后 aux 由 136 → 131。
+    source_splits: [train, val]
+    # 同一骨架同一候选池里：先取答案更短的，再按 sha1(seed:sample_id) 定序
+    prefer_shorter_answer: true
+
+train:
+  # 每个 epoch 走一遍 mixed/train.jsonl（471 行），30 步/epoch
+  # 8 epoch = 240 步。保留 --epochs 命令行覆盖（train_sft.py 里 pick() 优先取 CLI）。
+  epochs: 8
+  # 为什么是 8：90 步（3 epoch）只够学格式，240 步给模型多一点收敛余量；
+  # 但 471 行里唯一内容仅 199 条，8 遍 exposure 属偏重，必须靠 early stopping 兜底。
+  per_device_train_batch_size: 2
+  # 24G 卡上 4B + max_len 1024 的稳妥值（估算，未在真卡实测；A4000/3090/4090 均适用）
+  gradient_accumulation_steps: 8      # 有效批 = 2 × 8 = 16（单卡）
+  # 为什么有效批是 16：4B QLoRA + 1024 长度在 24G 上留足激活/梯度检查点余量，
+  # 再翻倍到 32 需 batch 4 或 accum 16，显存/步数都不划算。估算值，非实测。
+  learning_rate: 1.0e-4
+  # 为什么 1e-4：4B QLoRA 的常规区间是 1e-4 ~ 2e-4；本预算 8 epoch 属偏重，
+  # 取区间下限 1e-4，降低单步参数改动量，避免在 199 条唯一内容上过早记住答案。
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.05
+  # 为什么 5%：总 240 步 × 5% ≈ 12 步 warmup，让 4bit 量化 + 新初始化的 LoRA
+  # 在前 12 步左右稳定下来（3% 只有 7 步，量化噪声下偏少；10% 又浪费 24 步）。
+  lora_rank: 16                       # 199 条唯一内容撑不起更大秩；16 是 QLoRA 常规起点
+  lora_alpha: 32                      # alpha = 2 × rank，缩放系数 2，社区默认
+  lora_dropout: 0.05                  # 小数据下轻微正则，0.1 以上会拖慢收敛
+  max_len: 1024                       # 精写回答最长约 700 token，1024 留余量且不炸显存
+  max_grad_norm: 1.0                  # 默认梯度裁剪，8 epoch 下防偶发尖峰
+  # 按 epoch 评估/保存：与「重复写入 JSONL」的方案配套，epoch 语义清晰
+  eval_strategy: epoch
+  save_strategy: epoch
+  logging_steps: 10
+
+  # ---------------- early stopping / 选 best checkpoint ----------------
+  # 240 步里唯一内容 199 条，过拟合风险高，用 val loss 选 best 而不是取最后一轮。
+  # train_sft.py 会据此挂 EarlyStoppingCallback，并把 best 路径写进 train_summary.json。
+  load_best_model_at_end: true
+  metric_for_best_model: eval_loss
+  greater_is_better: false             # eval_loss 越低越好
+  early_stopping_patience: 3           # 连续 3 个 epoch eval_loss 没改善就停（8 epoch 最多留 3 次机会）
+  early_stopping_threshold: 0.0        # 必须严格下降才算改善，持平也算「没改善」
+  save_total_limit: 8                  # 每轮都留（8 epoch），确保 best 那轮不被清理掉
+
+model:
+  # 基座模型；命令行 --model 可覆盖
+  name: Qwen/Qwen3.5-4B
