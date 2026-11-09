@@ -112,6 +112,17 @@ def _send_email(subject: str, body: str, receiver: str) -> bool:
         return False
 
 
+async def send_user_email(user_id: str, subject: str, body: str) -> bool:
+    """按用户邮箱发信（供到价预警与持仓跟随共用）。未配置 SMTP 返回 False。"""
+    async with async_session() as db:
+        from ..models.user import User
+
+        user = await db.get(User, user_id)
+    if not user or not user.email:
+        return False
+    return bool(await asyncio.to_thread(_send_email, subject, body, user.email))
+
+
 async def check_all_alerts(user_id: str | None = None) -> Dict[str, Any]:
     """跑一轮检查。返回本轮统计，供 API 手动触发时复用。
 
@@ -169,21 +180,16 @@ async def check_all_alerts(user_id: str | None = None) -> Dict[str, Any]:
 
     # 邮件在事务提交后再发，避免发送失败回滚业务数据
     for t in triggered:
-        body = (
-            f"衡策 · 到价提醒\n"
-            f"股票：{t['name']}（{t['symbol']}）\n"
-            f"当前价：{t['price']:.2f}\n"
-            f"触发条件：{t['condition']}\n"
-            f"触发时间：{datetime.now():%Y-%m-%d %H:%M:%S}\n"
+        await send_user_email(
+            t["user_id"], f"[衡策] 到价提醒：{t['name']}",
+            (
+                f"衡策 · 到价提醒\n"
+                f"股票：{t['name']}（{t['symbol']}）\n"
+                f"当前价：{t['price']:.2f}\n"
+                f"触发条件：{t['condition']}\n"
+                f"触发时间：{datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            ),
         )
-        async with async_session() as db:
-            from ..models.user import User
-
-            user = await db.get(User, t["user_id"])
-            if user and user.email:
-                await asyncio.to_thread(
-                    _send_email, f"[衡策] 到价提醒：{t['name']}", body, user.email
-                )
 
     if triggered:
         logger.info(f"[alert] 本轮触发 {len(triggered)} 条")
@@ -200,6 +206,11 @@ async def _loop():
         try:
             if not settings.ALERT_TRADING_HOURS_ONLY or is_trading_now():
                 await check_all_alerts()
+            # 持仓跟随复用同一条 60s 轮询：价格规则内部按交易时段判断，
+            # 持仓/公告规则盘后也检查（公告多在盘后发布）
+            from .watch import check_watch_items
+
+            await check_watch_items()
         except asyncio.CancelledError:
             raise
         except Exception as e:
