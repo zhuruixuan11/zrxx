@@ -13,6 +13,15 @@ from ..agent.backtest import fetch_history_bars
 from .registry import get_strategy_class, list_registered_strategies
 
 
+# ========== 交易成本默认值（A 股现行规则）==========
+ANN_FACTOR = 252
+DEFAULT_COMMISSION = 0.0003        # 佣金万三（券商可调）
+DEFAULT_MIN_COMMISSION = 5.0       # 单笔最低佣金 5 元
+DEFAULT_STAMP_TAX = 0.001          # 印花税千一，仅卖出
+DEFAULT_TRANSFER_FEE = 0.00001     # 过户费 0.001%，买卖双边
+DEFAULT_SLIPPAGE = 0.0005          # 滑点万五，买入上浮/卖出下浮
+
+
 # ========== 策略元信息（前端下拉用）==========
 # 说明：id 与策略注册名一致，params 为各策略支持的参数及默认值。
 STRATEGY_META: Dict[str, Dict[str, Any]] = {
@@ -178,7 +187,7 @@ def _normalize_params(params: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _bars_to_df(bars: List[Dict[str, Any]]) -> pd.DataFrame:
-    """baostock bars → DataFrame（含策略需要的列）。"""
+    """baostock bars → DataFrame（含策略需要的列 + 停牌/涨跌停辅助列）。"""
     rows = []
     for b in bars:
         d = str(b.get("date", ""))
@@ -192,34 +201,46 @@ def _bars_to_df(bars: List[Dict[str, Any]]) -> pd.DataFrame:
             "close": close,
             "vol": vol,
             "amount": close * vol,
+            # 以下三列仅 baostock 主源有值；新浪兜底缺省为「正常交易、无昨收」
+            "preclose": float(b.get("preclose", 0) or 0),
+            "tradestatus": str(b.get("tradestatus", "1") or "1"),
+            "isST": int(float(b.get("isST", 0) or 0)),
         })
     df = pd.DataFrame(rows)
     df = df.sort_values("trade_date", ascending=True).reset_index(drop=True)
     return df
 
 
-async def run_strategy_backtest(
+def _limit_pct(symbol: str, is_st: bool) -> float:
+    """按板块返回涨跌幅限制比例（前复权下用 open/preclose 比值判断仍然有效）。"""
+    digits = "".join(ch for ch in str(symbol) if ch.isdigit())
+    code = digits[-6:] if len(digits) >= 6 else digits
+    if code.startswith(("688", "689", "300", "301")):
+        pct = 0.20  # 科创板 / 创业板
+    elif code.startswith(("4", "8", "920")):
+        pct = 0.30  # 北交所
+    else:
+        pct = 0.10  # 沪深主板
+    if is_st and pct == 0.10:
+        pct = 0.05  # 主板 ST/*ST
+    return pct
+
+
+def _simulate(
     symbol: str,
-    strategy: str = "ma_cross",
-    params: Optional[Mapping[str, Any]] = None,
-    initial_capital: float = 100_000.0,
-    days: int = 120,
-    frequency: str = "d",
-    commission: float = 0.0003,
-    stamp_tax: float = 0.001,
+    bars: List[Dict[str, Any]],
+    inst: Any,
+    params: Dict[str, Any],
+    days: int,
+    initial_capital: float,
+    commission: float,
+    stamp_tax: float,
+    slippage: float,
+    min_commission: float,
+    transfer_fee: float,
+    risk_free_rate: float,
 ) -> Dict[str, Any]:
-    """用内置策略跑一次单标的回测（baostock 日线，次日开盘成交）。"""
-    params = _normalize_params(params or {})
-    cls = get_strategy_class(strategy)
-    if getattr(cls, "requires_multi_asset", False):
-        raise ValueError(f"策略 {strategy} 需要多标的截面回测，当前仅支持单标的")
-    inst = cls()
-
-    # 多取 90 天做指标预热
-    bars = await fetch_history_bars(symbol, days=days + 90, frequency=frequency)
-    if len(bars) < 60:
-        raise ValueError(f"数据点太少 ({len(bars)})，无法回测")
-
+    """纯 CPU 段：K 线整理 + 指标预热 + 逐 bar 撮合 + 绩效统计。由 async 入口丢线程池执行。"""
     df = _bars_to_df(bars)
     df = inst.enrich(df, params)
 
@@ -231,6 +252,7 @@ async def run_strategy_backtest(
     cash = float(initial_capital)
     shares = 0.0
     entry_price = 0.0
+    entry_fee = 0.0  # 买入端已付费用，卖出时计入净盈亏
     trades: List[Dict[str, Any]] = []
     equity_curve: List[Dict[str, Any]] = []
     min_lot_cost = 0.0  # 一手（100 股）所需资金，用于资金不足时的提示
@@ -238,6 +260,11 @@ async def run_strategy_backtest(
 
     def _equity(price: float) -> float:
         return cash + shares * price
+
+    reject_limit_up = 0
+    reject_limit_down = 0
+    reject_suspended = 0
+    last_price = float(df["close"].iloc[max(start_idx - 1, 0)])
 
     prev_row = None
     for i in range(start_idx, len(df)):
@@ -253,54 +280,105 @@ async def run_strategy_backtest(
             if sig == 0:
                 sig = inst.signal(prev, df.iloc[i - 2] if i >= 2 else None, params, context)
 
-        fill = float(row["open"] or row["close"])
         date = str(row["trade_date"])
+        open_px = float(row.get("open") or 0.0)
+        close_px = float(row.get("close") or 0.0)
+        suspended = str(row.get("tradestatus", "1")) == "0"
+
+        # 停牌或全零行情：不允许成交，净值沿用上一根有效价（避免零价除零/净值跳水）
+        if suspended or (open_px <= 0 and close_px <= 0):
+            if suspended:
+                reject_suspended += 1
+            equity_curve.append({"date": date, "equity": round(_equity(last_price), 2)})
+            prev_row = row
+            continue
+
+        fill = open_px if open_px > 0 else close_px
+        # 涨跌停：开盘即封板视为无法成交（前复权下 open 与 preclose 同比例缩放，比值有效）
+        preclose = float(row.get("preclose") or 0.0)
+        limit_up_open = limit_down_open = False
+        if preclose > 0:
+            pct = _limit_pct(symbol, bool(row.get("isST")))
+            limit_up_open = fill >= preclose * (1 + pct) * (1 - 1e-4)
+            limit_down_open = fill <= preclose * (1 - pct) * (1 + 1e-4)
 
         if sig == 1 and shares == 0 and cash > 0:
-            frac = float(inst.position_fraction(params, {**context, "signal_row": prev}))
-            frac = max(0.0, min(1.0, frac))
-            budget = cash * frac
-            max_shares = int(budget / (fill * (1 + commission)) / 100) * 100
-            if max_shares > 0:
-                cost = max_shares * fill
-                fee = cost * commission
-                cash -= cost + fee
-                shares = float(max_shares)
-                entry_price = fill
-                trades.append({"date": date, "action": "BUY", "price": round(fill, 2),
-                               "shares": max_shares, "amount": round(cost, 2),
-                               "fee": round(fee, 2), "pnl": 0.0})
+            if limit_up_open:
+                reject_limit_up += 1
             else:
-                lot_blocked = True
-                min_lot_cost = fill * 100 * (1 + commission)
+                frac = float(inst.position_fraction(params, {**context, "signal_row": prev}))
+                frac = max(0.0, min(1.0, frac))
+                budget = cash * frac
+                buy_px = fill * (1 + slippage)  # 买入滑点：成交价上浮
+                # 按含费成本反推可买手数，再逐手回退，保证现金不会被最低佣金打穿
+                max_shares = int(budget / (buy_px * (1 + commission + transfer_fee)) / 100) * 100
+                while max_shares > 0:
+                    cost = max_shares * buy_px
+                    fee = max(cost * commission, min_commission) + cost * transfer_fee
+                    if cost + fee <= cash:
+                        break
+                    max_shares -= 100
+                if max_shares > 0:
+                    cost = max_shares * buy_px
+                    fee = max(cost * commission, min_commission) + cost * transfer_fee
+                    cash -= cost + fee
+                    shares = float(max_shares)
+                    entry_price = buy_px
+                    entry_fee = fee
+                    trades.append({"date": date, "action": "BUY", "price": round(buy_px, 2),
+                                   "shares": max_shares, "amount": round(cost, 2),
+                                   "fee": round(fee, 2), "pnl": 0.0})
+                else:
+                    lot_blocked = True
+                    min_lot_cost = fill * 100 * (1 + commission + transfer_fee) + min_commission
 
         elif sig == -1 and shares > 0:
-            revenue = shares * fill
-            fee = revenue * (commission + stamp_tax)
-            pnl = (fill - entry_price) * shares - fee
-            cash += revenue - fee
-            trades.append({"date": date, "action": "SELL", "price": round(fill, 2),
-                           "shares": int(shares), "amount": round(revenue, 2),
-                           "fee": round(fee, 2), "pnl": round(pnl, 2)})
-            shares = 0.0
-            entry_price = 0.0
+            if limit_down_open:
+                reject_limit_down += 1
+            else:
+                sell_px = fill * (1 - slippage)  # 卖出滑点：成交价下浮
+                revenue = shares * sell_px
+                fee = max(revenue * commission, min_commission) + revenue * (stamp_tax + transfer_fee)
+                # 净盈亏 = 卖出净收入 - 买入总成本（含买入费用）
+                pnl = revenue - fee - (entry_price * shares + entry_fee)
+                cash += revenue - fee
+                trades.append({"date": date, "action": "SELL", "price": round(sell_px, 2),
+                               "shares": int(shares), "amount": round(revenue, 2),
+                               "fee": round(fee, 2), "pnl": round(pnl, 2)})
+                shares = 0.0
+                entry_price = 0.0
+                entry_fee = 0.0
 
-        equity_curve.append({"date": date, "equity": round(_equity(float(row["close"])), 2)})
+        last_price = close_px if close_px > 0 else last_price
+        equity_curve.append({"date": date, "equity": round(_equity(last_price), 2)})
         prev_row = row
 
-    final_equity = _equity(float(df["close"].iloc[-1]))
+    final_equity = _equity(last_price)
     total_return = (final_equity - initial_capital) / initial_capital * 100
 
     equity_arr = np.array([e["equity"] for e in equity_curve], dtype=float)
     daily_ret = np.diff(equity_arr) / equity_arr[:-1] if len(equity_arr) > 1 else np.array([])
-    ann_factor = 252
+    ann_factor = ANN_FACTOR
     annual = ((1 + total_return / 100) ** (ann_factor / max(len(daily_ret), 1)) - 1) * 100 if len(daily_ret) > 0 else 0.0
-    sharpe = float(daily_ret.mean() / daily_ret.std() * np.sqrt(ann_factor)) if len(daily_ret) > 1 and daily_ret.std() > 0 else 0.0
+
+    rf_daily = risk_free_rate / ann_factor
+    excess = daily_ret - rf_daily
+    vol = float(daily_ret.std(ddof=1)) if len(daily_ret) > 1 else 0.0
+    sharpe = float(excess.mean() / vol * np.sqrt(ann_factor)) if vol > 0 else 0.0
+    downside = excess[excess < 0]
+    downside_vol = float(downside.std(ddof=1)) if len(downside) > 1 else 0.0
+    sortino = float(excess.mean() / downside_vol * np.sqrt(ann_factor)) if downside_vol > 0 else 0.0
+    annual_vol = vol * np.sqrt(ann_factor) * 100
+
     peak = np.maximum.accumulate(equity_arr) if len(equity_arr) else np.array([initial_capital])
     max_dd = float(((peak - equity_arr) / peak).max() * 100) if len(equity_arr) else 0.0
+    calmar = float(annual / max_dd) if max_dd > 0 else 0.0
 
     sells = [t for t in trades if t["action"] == "SELL"]
     win_rate = sum(1 for t in sells if t["pnl"] > 0) / len(sells) * 100 if sells else 0.0
+    gains = sum(t["pnl"] for t in sells if t["pnl"] > 0)
+    losses = sum(t["pnl"] for t in sells if t["pnl"] < 0)
+    profit_factor = float(gains / abs(losses)) if losses < 0 else 0.0
 
     warning = None
     if lot_blocked and min_lot_cost > 0:
@@ -310,24 +388,96 @@ async def run_strategy_backtest(
         )
 
     return {
-        "symbol": symbol,
-        "strategy": strategy,
-        "strategy_name": STRATEGY_META.get(strategy, {}).get("name", strategy),
-        "params": params,
         "bars_count": len(equity_curve),
         "warning": warning,
+        "cost_model": {
+            "commission": commission,
+            "min_commission": min_commission,
+            "stamp_tax": stamp_tax,
+            "transfer_fee": transfer_fee,
+            "slippage": slippage,
+            "fill_rule": "信号基于上一根已收盘K线，本根开盘价±滑点成交",
+            "tradability": "涨停不买、跌停不卖、停牌跳过（按板块/ST 涨跌幅限制）",
+            "adjustflag": "2=前复权",
+            "lot_size": 100,
+        },
+        "rejections": {
+            "limit_up": reject_limit_up,
+            "limit_down": reject_limit_down,
+            "suspended": reject_suspended,
+        },
         "metrics": {
             "total_return_pct": round(total_return, 2),
             "annual_return_pct": round(float(annual), 2),
             "sharpe_ratio": round(sharpe, 2),
+            "sortino_ratio": round(sortino, 2),
+            "calmar_ratio": round(calmar, 2),
             "max_drawdown_pct": round(max_dd, 2),
+            "annual_volatility_pct": round(annual_vol, 2),
             "win_rate_pct": round(win_rate, 2),
+            "profit_factor": round(profit_factor, 2),
+            "risk_free_rate": risk_free_rate,
             "initial_capital": round(initial_capital, 2),
             "final_equity": round(final_equity, 2),
             "trades_count": len(trades),
         },
+        "metrics_meta": {
+            "sharpe_ratio": "mean(r - rf/252) / std(r, ddof=1) × √252",
+            "sortino_ratio": "mean(r - rf/252) / std(下行超额收益, ddof=1) × √252",
+            "calmar_ratio": "年化收益 / 最大回撤",
+            "annual_volatility_pct": "std(日收益, ddof=1) × √252 × 100",
+            "profit_factor": "卖出盈利合计 / |卖出亏损合计|（单笔净盈亏含双边费用）",
+            "win_rate_pct": "盈利卖出笔数 / 卖出笔数",
+            "risk_free_rate": "年化无风险利率，与基准页口径一致（当前取 0）",
+        },
         "trades": trades,
         "equity_curve": equity_curve,
+    }
+
+
+async def run_strategy_backtest(
+    symbol: str,
+    strategy: str = "ma_cross",
+    params: Optional[Mapping[str, Any]] = None,
+    initial_capital: float = 100_000.0,
+    days: int = 120,
+    frequency: str = "d",
+    commission: float = DEFAULT_COMMISSION,
+    stamp_tax: float = DEFAULT_STAMP_TAX,
+    slippage: float = DEFAULT_SLIPPAGE,
+    min_commission: float = DEFAULT_MIN_COMMISSION,
+    transfer_fee: float = DEFAULT_TRANSFER_FEE,
+    risk_free_rate: float = 0.0,
+) -> Dict[str, Any]:
+    """用内置策略跑一次单标的回测（baostock 前复权日线，次日开盘成交）。
+
+    取数是真异步（网关内部走线程池），撮合与指标是纯 CPU；
+    后者统一丢到线程池，避免 days 较大时占住事件循环。
+    """
+    params = _normalize_params(params or {})
+    cls = get_strategy_class(strategy)
+    if getattr(cls, "requires_multi_asset", False):
+        raise ValueError(f"策略 {strategy} 需要多标的截面回测，当前仅支持单标的")
+    inst = cls()
+
+    # 多取 90 天做指标预热
+    bars = await fetch_history_bars(symbol, days=days + 90, frequency=frequency)
+    if len(bars) < 60:
+        raise ValueError(f"数据点太少 ({len(bars)})，无法回测")
+
+    result = await asyncio.to_thread(
+        _simulate,
+        symbol, bars, inst, params, days, float(initial_capital),
+        commission, stamp_tax, slippage, min_commission, transfer_fee, risk_free_rate,
+    )
+
+    return {
+        "symbol": symbol,
+        "strategy": strategy,
+        "strategy_name": STRATEGY_META.get(strategy, {}).get("name", strategy),
+        "params": params,
+        "data_source": "baostock(前复权)" if bars[0].get("source") == "baostock" else "sina(不复权兜底)",
+        **result,
     }
 
 

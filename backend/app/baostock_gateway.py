@@ -312,28 +312,45 @@ async def fetch_bars(
     frequency: str = "d",
     adjustflag: str = "3",
     timeout: float = _DEFAULT_TIMEOUT,
-) -> Optional[List[Dict[str, float]]]:
-    """拉日线/分钟线。返回 None=不可用，[]=无数据，否则为 bar 列表（按时间升序）。"""
+    extra_fields: str = "",
+) -> Optional[List[Dict[str, Any]]]:
+    """拉日线/分钟线。返回 None=不可用，[]=无数据，否则为 bar 列表（按时间升序）。
+
+    extra_fields: 逗号分隔的附加字段（如 "preclose,tradestatus,isST"），
+    会原样透传给 baostock 并挂在每个 bar 上（数值转 float，tradestatus 保留字符串）。
+    """
+    extra_keys = [f.strip() for f in extra_fields.split(",") if f.strip()]
+    fields = "date,open,high,low,close,volume" + ("," + ",".join(extra_keys) if extra_keys else "")
     rows = await fetch_rows(
-        code, "date,open,high,low,close,volume",
+        code, fields,
         start_date, end_date, frequency, adjustflag, timeout,
     )
     if rows is None:
         return None
 
-    bars: List[Dict[str, float]] = []
+    bars: List[Dict[str, Any]] = []
     for r in rows:
         try:
             if len(r) < 6:
                 continue
-            bars.append({
+            bar: Dict[str, Any] = {
                 "date": r[0],
-                "open": float(r[1]),
-                "high": float(r[2]),
-                "low": float(r[3]),
-                "close": float(r[4]),
+                "open": float(r[1]) if r[1] else 0.0,
+                "high": float(r[2]) if r[2] else 0.0,
+                "low": float(r[3]) if r[3] else 0.0,
+                "close": float(r[4]) if r[4] else 0.0,
                 "volume": float(r[5]) if r[5] else 0.0,
-            })
+            }
+            for idx, key in enumerate(extra_keys, start=6):
+                raw = r[idx] if idx < len(r) else ""
+                if key == "tradestatus":
+                    bar[key] = str(raw or "1")
+                else:
+                    try:
+                        bar[key] = float(raw) if raw not in ("", None) else 0.0
+                    except (TypeError, ValueError):
+                        bar[key] = 0.0
+            bars.append(bar)
         except (ValueError, IndexError):
             continue
     return bars
@@ -433,3 +450,79 @@ async def fetch_bars_many(
     with _state:
         _query_count += len(codes)
     return result
+
+
+# ---------- 股票基础信息（名称 + 申万行业）----------
+_BASICS_CACHE: Optional[tuple] = None
+_BASICS_TTL = 24 * 3600.0
+
+
+async def fetch_stock_basics(timeout: float = 40.0) -> Optional[Dict[str, Dict[str, str]]]:
+    """一次拉全市场股票名称与行业（baostock query_stock_industry，24h 缓存）。
+
+    返回 ``{sh.600519: {"name": "贵州茅台", "industry": "白酒", "classification": "申万一级"}}``；
+    None 表示 baostock 当前不可用（调用方可回退其他来源）。
+    """
+    global _BASICS_CACHE
+
+    with _state:
+        if _BASICS_CACHE and time.monotonic() - _BASICS_CACHE[0] < _BASICS_TTL:
+            return _BASICS_CACHE[1]
+
+    if is_open():
+        return None
+
+    def _run() -> Optional[Dict[str, Dict[str, str]]]:
+        try:
+            import baostock as bs
+        except ImportError:
+            return None
+
+        gate = _gate
+        if not gate.acquire(timeout=_STUCK_SECONDS):
+            _drop_session("gate stuck (basics)")
+            _record_failure("basics query stuck")
+            return None
+        try:
+            if not _login_locked(bs):
+                return None
+            _respect_interval()
+            try:
+                rs = bs.query_stock_industry()
+            except Exception as e:  # noqa: BLE001
+                _drop_session(f"basics exception: {e}")
+                return None
+            if rs is None or rs.error_code != "0":
+                _drop_session("basics query failed")
+                return None
+
+            out: Dict[str, Dict[str, str]] = {}
+            while rs.next():
+                r = rs.get_row_data()
+                # updateDate, code, code_name, industry, industryClassification
+                if len(r) >= 5 and r[1]:
+                    out[r[1]] = {
+                        "name": r[2],
+                        "industry": r[3],
+                        "classification": r[4],
+                    }
+            return out
+        finally:
+            gate.release()
+
+    loop = asyncio.get_running_loop()
+    try:
+        data = await asyncio.wait_for(loop.run_in_executor(_EXECUTOR, _run), timeout=timeout)
+    except asyncio.TimeoutError:
+        _record_failure(f"basics timeout > {timeout:.0f}s")
+        return None
+
+    if data is None:
+        _record_failure("basics unavailable")
+        return None
+
+    _record_success()
+    with _state:
+        _BASICS_CACHE = (time.monotonic(), data)
+    logger.info(f"[baostock] 股票基础信息已缓存：{len(data)} 条")
+    return data

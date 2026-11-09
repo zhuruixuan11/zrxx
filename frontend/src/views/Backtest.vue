@@ -148,6 +148,30 @@
             <div class="metric-value">¥{{ fmt(result.metrics.final_equity) }}</div>
           </el-card>
         </el-col>
+        <el-col :xs="12" :sm="8" :md="4">
+          <el-card class="metric-card" shadow="hover">
+            <div class="metric-label">索提诺比率</div>
+            <div class="metric-value">{{ (result.metrics.sortino_ratio ?? 0).toFixed(2) }}</div>
+          </el-card>
+        </el-col>
+        <el-col :xs="12" :sm="8" :md="4">
+          <el-card class="metric-card" shadow="hover">
+            <div class="metric-label">卡玛比率</div>
+            <div class="metric-value">{{ (result.metrics.calmar_ratio ?? 0).toFixed(2) }}</div>
+          </el-card>
+        </el-col>
+        <el-col :xs="12" :sm="8" :md="4">
+          <el-card class="metric-card" shadow="hover">
+            <div class="metric-label">盈亏比</div>
+            <div class="metric-value">{{ (result.metrics.profit_factor ?? 0).toFixed(2) }}</div>
+          </el-card>
+        </el-col>
+        <el-col :xs="12" :sm="8" :md="4">
+          <el-card class="metric-card" shadow="hover">
+            <div class="metric-label">年化波动</div>
+            <div class="metric-value">{{ (result.metrics.annual_volatility_pct ?? 0).toFixed(2) }}%</div>
+          </el-card>
+        </el-col>
       </el-row>
 
       <!-- K 线交易信号 -->

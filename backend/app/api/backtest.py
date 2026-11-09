@@ -54,7 +54,11 @@ def strategies():
         "data": {
             "strategies": list_strategies(),
             "groups": sorted({m.get("group", "") for m in STRATEGY_META.values() if m.get("group")}),
-            "note": "数据源：baostock 前复权日线。费用：佣金万三 + 卖出印花税千一。成交：次日开盘。",
+            "note": (
+                "数据源：baostock 前复权日线（adjustflag=2）。"
+                "成本：佣金万三（单笔最低 5 元）+ 卖出印花税千一 + 过户费 0.001%（双边）+ 滑点万五。"
+                "成交：信号基于上一根已收盘 K 线，次日开盘价±滑点成交。"
+            ),
         },
     }
 

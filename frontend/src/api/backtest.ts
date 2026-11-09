@@ -5,8 +5,13 @@ export interface BacktestMetrics {
   total_return_pct: number
   annual_return_pct: number
   sharpe_ratio: number
+  sortino_ratio?: number
+  calmar_ratio?: number
   max_drawdown_pct: number
+  annual_volatility_pct?: number
   win_rate_pct: number
+  profit_factor?: number
+  risk_free_rate?: number
   initial_capital: number
   final_equity: number
   trades_count: number
