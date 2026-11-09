@@ -13,6 +13,9 @@
 logs/
 *.log
 
+# 训练产物（LoRA 适配器、checkpoint、评测预测）
+backend/outputs/
+
 # Python
 __pycache__/
 *.py[cod]

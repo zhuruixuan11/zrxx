@@ -66,6 +66,12 @@ class Settings(BaseSettings):
         "投资有风险，入市需谨慎。"
     )
 
+    # 合规审查（衡策 → Legal-Agent，仅投资分析/风险评估送审）
+    # 关闭或 Legal-Agent 不可用时，分析结果照常返回，只在末尾标注「未审」
+    COMPLIANCE_ENABLED: bool = True
+    LEGAL_AGENT_URL: str = "http://127.0.0.1:8021"
+    LEGAL_AGENT_TIMEOUT_SECONDS: float = 5.0
+
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 
 

@@ -14,6 +14,7 @@ from ..config import get_settings
 from ..database import async_session
 from ..models.user import User
 from ..security import get_current_user
+from ..services import compliance
 
 limiter = Limiter(key_func=lambda request: get_ipaddr(request))
 
@@ -70,6 +71,9 @@ async def chat(req: ChatRequest, request: Request, user: User = Depends(get_curr
                 "intent": "chitchat",
             }
 
+        # 投资分析 / 风险评估结果送 Legal-Agent 合规审查；不可用时只标注「未审」
+        await compliance.enrich_result(result)
+
         # 保存 AI 回复（回测卡片等结构化数据一并落库，刷新/换设备后可恢复）
         import json as _json
         intent = result.get("intent")
@@ -101,6 +105,7 @@ async def chat(req: ChatRequest, request: Request, user: User = Depends(get_curr
         "backtest_results": result.get("backtest_results", []),  # 按 symbol 分组的 [{symbol, symbol_name, results: [...]}]
         "symbols": result.get("symbols", []),
         "symbol_names": result.get("symbol_names", []),
+        "compliance": result.get("compliance"),
     }
     # 只缓存成功回答；超时兜底是暂态，不缓存
     if result.get("response_type") != "timeout":
