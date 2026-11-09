@@ -15,6 +15,11 @@ logs/
 
 # 训练产物（LoRA 适配器、checkpoint、评测预测）
 backend/outputs/
+backend/training/outputs/
+
+# 训练/语料数据与本地备份（体积大，不入库）
+backend/data/
+backend/backups/
 
 # Python
 __pycache__/
