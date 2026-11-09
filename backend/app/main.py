@@ -15,13 +15,16 @@ from .api.alerts import router as alerts_router
 from .api.auth import router as auth_router
 from .api.agent import router as agent_router
 from .api.backtest import router as backtest_router
+from .api.benchmark import router as benchmark_router
 from .api.datasets import router as datasets_router
+from .api.finetune import router as finetune_router
 from .api.market import prewarm_caches
 from .api.market import router as market_router
 from .api.news import router as news_router
 from .api.portfolio import router as portfolio_router
 from .api.profile import router as profile_router
 from .api.signals import router as signals_router
+from .api.watch import router as watch_router
 from .services.alerts import start_monitor, stop_monitor
 from .services.daily_cache import start_daily_cache_scheduler, stop_daily_cache_scheduler
 
@@ -55,6 +58,10 @@ async def lifespan(app: fastapi.FastAPI):
                 "请生成随机密钥后写入 backend/.env：python -c \"import secrets;print(secrets.token_urlsafe(48))\""
             )
     await init_tables()
+    # 恢复上次激活的微调模型（若有）
+    from .services.finetune import restore_override_on_startup
+
+    await restore_override_on_startup()
     start_monitor()
     start_daily_cache_scheduler()
     warmup_task = asyncio.create_task(prewarm_caches())
@@ -91,11 +98,14 @@ app.include_router(profile_router)
 app.include_router(auth_router)
 app.include_router(agent_router)
 app.include_router(backtest_router)
+app.include_router(benchmark_router)
 app.include_router(datasets_router)
+app.include_router(finetune_router)
 app.include_router(market_router)
 app.include_router(news_router)
 app.include_router(portfolio_router)
 app.include_router(signals_router)
+app.include_router(watch_router)
 
 @app.get("/", include_in_schema=False)
 async def index():

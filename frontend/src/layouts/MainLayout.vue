@@ -41,9 +41,17 @@
           <el-icon><DataAnalysis /></el-icon>
           <template #title>策略回测</template>
         </el-menu-item>
+        <el-menu-item index="/benchmark">
+          <el-icon><Aim /></el-icon>
+          <template #title>基准跟随</template>
+        </el-menu-item>
         <el-menu-item index="/alerts">
           <el-icon><Bell /></el-icon>
           <template #title>到价预警</template>
+        </el-menu-item>
+        <el-menu-item index="/watch">
+          <el-icon><View /></el-icon>
+          <template #title>持仓跟随</template>
         </el-menu-item>
         <el-menu-item index="/profile">
           <el-icon><User /></el-icon>

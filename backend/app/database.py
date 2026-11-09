@@ -28,6 +28,8 @@ if _settings.DATABASE_URL.startswith("sqlite"):
         cur.execute("PRAGMA journal_mode=WAL")
         cur.execute("PRAGMA synchronous=NORMAL")
         cur.execute("PRAGMA foreign_keys=ON")
+        # 写-写在 WAL 下依然互斥：给一个有限的等待窗口，而不是立刻报 locked
+        cur.execute(f"PRAGMA busy_timeout={int(_settings.SQLITE_BUSY_TIMEOUT_MS)}")
         cur.close()
 
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -57,6 +59,8 @@ async def init_tables():
     from .models.alert import PriceAlert  # noqa: F401
     from .models.backtest_run import BacktestRun  # noqa: F401
     from .models.daily_bar import DailyBar, DailyCacheMeta  # noqa: F401
+    from .models.finetune import FineTuneJob  # noqa: F401
+    from .models.watch import WatchItem, WatchEvent  # noqa: F401
 
     # 1) SQLite 字段迁移 — 老库补新列（绕过 aiosqlite 直接 sync 操作）
     try:
@@ -80,7 +84,7 @@ async def init_tables():
         ]
 
         def _do_migrate():
-            conn = _sqlite3.connect(db_path)
+            conn = _sqlite3.connect(db_path, timeout=_settings.SQLITE_BUSY_TIMEOUT_MS / 1000)
             for table, column, ddl in _COLUMNS:
                 cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
                 if not cols:
