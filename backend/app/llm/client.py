@@ -27,6 +27,9 @@ class LLMClient:
 
     def is_mock(self) -> bool:
         """无 API Key 或显式 mock → 用本地兜底。"""
+        # 微调模型由百炼（DashScope）托管，走 qwen 兼容接口
+        if _model_override or self.settings.QWEN_FINETUNED_MODEL:
+            return not self.settings.QWEN_API_KEY
         if self._provider == "mock":
             return True
         # 检查对应 key 是否配置
@@ -50,6 +53,20 @@ class LLMClient:
         provider = self._provider
         # 统一加超时与重试上限：避免网络异常时请求挂几分钟、前端一直转圈
         common = dict(temperature=0.5, timeout=40, max_retries=1, max_tokens=1500)
+
+        # 微调模型优先：无论主 Provider 是什么，微调产出都由百炼托管，
+        # 必须走 DashScope 的 OpenAI 兼容端点，否则会拿模型名去别的厂商请求而 404。
+        finetuned = _model_override or self.settings.QWEN_FINETUNED_MODEL
+        if finetuned:
+            self._llm = ChatOpenAI(
+                api_key=self.settings.QWEN_API_KEY,
+                model=finetuned,
+                base_url=self.settings.QWEN_BASE_URL,
+                **common,
+            )
+            logger.info("[LLM] 使用微调模型 model={}", finetuned)
+            return self._llm
+
         if provider == "deepseek":
             self._llm = ChatOpenAI(
                 api_key=self.settings.DEEPSEEK_API_KEY,
@@ -176,6 +193,22 @@ class LLMClient:
 
 
 _client: Optional[LLMClient] = None
+
+# 运行时模型覆盖：微调产出的模型名（None 表示用配置里的默认模型）
+_model_override: Optional[str] = None
+
+
+def set_model_override(name: Optional[str]) -> None:
+    """切换运行时模型。清空已缓存的 ChatOpenAI 实例以触发重建。"""
+    global _model_override
+    _model_override = (name or "").strip() or None
+    if _client is not None:
+        _client._llm = None
+    logger.info("[LLM] 模型 override → {}", _model_override or "(未设置)")
+
+
+def get_model_override() -> Optional[str]:
+    return _model_override
 
 
 def get_llm() -> LLMClient:
