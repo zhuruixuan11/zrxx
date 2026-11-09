@@ -40,9 +40,14 @@ pydantic-settings>=2.2.0
 # ============ 美股行情（延迟 import，缺失时仅美股相关功能不可用）============
 yfinance>=0.2.40
 
-# ============ 可选（RAG 向量库）========
-# 先用本地 JSON + 关键词检索，避免 chromadb 安装重量
-# 需要时再：pip install chromadb sentence-transformers
+# ============ RAG 混合召回（全部本地离线，不依赖联网 API）============
+# BM25 稀疏通道 + jieba 中文分词
+rank_bm25>=0.2.2
+jieba>=0.42.1
+# 向量通道：transformers 直接加载 bge-small-zh-v1.5（CLS pooling + L2）
+# 不装 sentence-transformers，少一层依赖；模型目录用 RAG_EMBED_MODEL_PATH 配置
+transformers>=4.40.0
+torch>=2.0.0
 
 # ============ 测试 ============
 pytest>=9.0
